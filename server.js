@@ -1,277 +1,645 @@
-// Rental Property Assistant - Express Backend
-// Deploy to Railway, Fly.io, or Vercel Functions
-// Dependencies: npm install express cors dotenv supabase-js twilio axios node-cron
+// ============================================
+// FILE: server.js - RENTFLOW BACKEND
+// ============================================
 
-import express from 'express';
-import cors from 'cors';
-import dotenv from 'dotenv';
-import { createClient } from '@supabase/supabase-js';
-import twilio from 'twilio';
-import Anthropic from '@anthropic-ai/sdk';
-import cron from 'node-cron';
-import crypto from 'crypto';
+const express = require('express');
+const cors = require('cors');
+const dotenv = require('dotenv');
+const { createClient } = require('@supabase/supabase-js');
+const Stripe = require('stripe');
+const twilio = require('twilio');
+const Anthropic = require('@anthropic-ai/sdk');
 
-dotenv.config();
+// Load .env only in development, not in production (Railway)
+if (process.env.NODE_ENV !== 'production') {
+  dotenv.config();
+}
+
+// ============================================
+// INITIALIZE ALL SERVICES
+// ============================================
 
 const app = express();
-const PORT = process.env.PORT || 3001;
 
-// Initialize clients
+// Middleware
+app.use(express.json());
+app.use(cors());
+
+// Supabase (Database)
 const supabase = createClient(
   process.env.SUPABASE_URL,
-  process.env.SUPABASE_KEY
+  process.env.SUPABASE_SERVICE_ROLE_KEY
 );
 
+// Stripe (Payments)
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
+
+// Twilio (SMS)
 const twilioClient = twilio(
   process.env.TWILIO_ACCOUNT_SID,
   process.env.TWILIO_AUTH_TOKEN
 );
 
-const claudeClient = new Anthropic({
-  apiKey: process.env.CLAUDE_API_KEY,
+// Claude (AI)
+const anthropic = new Anthropic({
+  apiKey: process.env.CLAUDE_API_KEY
 });
 
-app.use(cors());
-app.use(express.json());
+// ============================================
+// AUTHENTICATION ROUTES
+// ============================================
 
-// ========== PROPERTIES ==========
-
-// Get all properties for customer
-app.get('/api/properties', async (req, res) => {
+// Register new landlord
+app.post('/api/auth/register', async (req, res) => {
   try {
-    const customerId = req.headers['x-customer-id'];
-    const { data, error } = await supabase
-      .from('properties')
-      .select('*')
-      .eq('customer_id', customerId);
-    
-    if (error) throw error;
-    res.json(data);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
+    const { email, password, name, phone } = req.body;
+
+    if (!email || !password || !name) {
+      return res.status(400).json({ error: 'Missing required fields' });
+    }
+
+    const { data: authData, error: authError } = await supabase.auth.signUpWithPassword({
+      email,
+      password
+    });
+
+    if (authError) {
+      return res.status(400).json({ error: authError.message });
+    }
+
+    const { data: customer, error: dbError } = await supabase
+      .from('customers')
+      .insert([
+        {
+          user_id: authData.user.id,
+          email,
+          name,
+          phone,
+          trial_ends_at: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000),
+          status: 'active'
+        }
+      ])
+      .select();
+
+    if (dbError) {
+      return res.status(400).json({ error: dbError.message });
+    }
+
+    res.json({
+      success: true,
+      customer: customer[0],
+      user: authData.user
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
   }
 });
+
+// Login
+app.post('/api/auth/login', async (req, res) => {
+  try {
+    const { email, password } = req.body;
+
+    const { data, error } = await supabase.auth.signInWithPassword({
+      email,
+      password
+    });
+
+    if (error) {
+      return res.status(400).json({ error: error.message });
+    }
+
+    res.json({
+      success: true,
+      user: data.user,
+      session: data.session
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ============================================
+// PROPERTY MANAGEMENT ROUTES
+// ============================================
 
 // Create property
 app.post('/api/properties', async (req, res) => {
   try {
-    const { address, units, customerId } = req.body;
+    const { user_id, address, city, province, postal_code, property_type, rent_amount, bedrooms, bathrooms } = req.body;
+
     const { data, error } = await supabase
       .from('properties')
       .insert([
         {
+          user_id,
           address,
-          units,
-          customer_id: customerId,
-          created_at: new Date().toISOString(),
-        },
+          city,
+          province,
+          postal_code,
+          property_type,
+          rent_amount,
+          bedrooms,
+          bathrooms,
+          created_at: new Date()
+        }
       ])
       .select();
-    
-    if (error) throw error;
-    res.json(data[0]);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
+
+    if (error) {
+      return res.status(400).json({ error: error.message });
+    }
+
+    res.json({ success: true, property: data[0] });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
   }
 });
 
-// ========== TENANTS ==========
+// Get all properties for user
+app.get('/api/properties/:user_id', async (req, res) => {
+  try {
+    const { user_id } = req.params;
 
+    const { data, error } = await supabase
+      .from('properties')
+      .select('*')
+      .eq('user_id', user_id);
+
+    if (error) {
+      return res.status(400).json({ error: error.message });
+    }
+
+    res.json({ success: true, properties: data });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Update property
+app.put('/api/properties/:property_id', async (req, res) => {
+  try {
+    const { property_id } = req.params;
+    const updates = req.body;
+
+    const { data, error } = await supabase
+      .from('properties')
+      .update(updates)
+      .eq('id', property_id)
+      .select();
+
+    if (error) {
+      return res.status(400).json({ error: error.message });
+    }
+
+    res.json({ success: true, property: data[0] });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ============================================
+// TENANT MANAGEMENT ROUTES
+// ============================================
+
+// Add tenant to property
 app.post('/api/tenants', async (req, res) => {
   try {
-    const { propertyId, name, phone, email, rentDueDay, customerId } = req.body;
-    
+    const { property_id, name, email, phone, lease_start_date, lease_end_date } = req.body;
+
     const { data, error } = await supabase
       .from('tenants')
       .insert([
         {
-          property_id: propertyId,
+          property_id,
           name,
-          phone,
           email,
-          rent_due_day: rentDueDay,
-          customer_id: customerId,
-          created_at: new Date().toISOString(),
-        },
+          phone,
+          lease_start_date,
+          lease_end_date,
+          created_at: new Date()
+        }
       ])
       .select();
-    
-    if (error) throw error;
-    res.json(data[0]);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
+
+    if (error) {
+      return res.status(400).json({ error: error.message });
+    }
+
+    res.json({ success: true, tenant: data[0] });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
   }
 });
 
 // Get tenants for property
-app.get('/api/properties/:propertyId/tenants', async (req, res) => {
+app.get('/api/tenants/:property_id', async (req, res) => {
   try {
+    const { property_id } = req.params;
+
     const { data, error } = await supabase
       .from('tenants')
       .select('*')
-      .eq('property_id', req.params.propertyId);
-    
-    if (error) throw error;
-    res.json(data);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
+      .eq('property_id', property_id);
+
+    if (error) {
+      return res.status(400).json({ error: error.message });
+    }
+
+    res.json({ success: true, tenants: data });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
   }
 });
 
-// ========== AUTOMATED MESSAGING ==========
+// ============================================
+// PAYMENT TRACKING ROUTES
+// ============================================
 
-// Generate rental reminder via Claude
-async function generateTenantMessage(tenant, messageType = 'rent_reminder') {
+// Mark payment as paid
+app.post('/api/payments/mark-paid', async (req, res) => {
   try {
-    const prompts = {
-      rent_reminder: `Generate a professional, friendly rent reminder SMS for a tenant named ${tenant.name}. Rent is due on the ${tenant.rent_due_day}th of the month. Keep it under 160 characters for SMS. No emojis.`,
-      
-      maintenance_request: `Generate a professional maintenance request confirmation SMS for tenant ${tenant.name}. Confirm we received their request and will respond within 24 hours. Keep it under 160 characters.`,
-      
-      late_payment: `Generate a firm but professional late payment reminder SMS for tenant ${tenant.name}. Rent was due on the ${tenant.rent_due_day}th. Request payment within 3 days. Keep it under 160 characters.`,
-    };
+    const { tenant_id, amount, payment_date, payment_method, user_id } = req.body;
 
-    const message = await claudeClient.messages.create({
-      model: 'claude-3-5-sonnet-20241022',
-      max_tokens: 100,
-      messages: [
+    const { data: paymentData, error: paymentError } = await supabase
+      .from('payments')
+      .insert([
         {
-          role: 'user',
-          content: prompts[messageType],
-        },
-      ],
+          tenant_id,
+          amount,
+          payment_date: payment_date || new Date(),
+          payment_method,
+          status: 'paid',
+          created_at: new Date()
+        }
+      ])
+      .select();
+
+    if (paymentError) {
+      return res.status(400).json({ error: paymentError.message });
+    }
+
+    const { data: tenantData } = await supabase
+      .from('tenants')
+      .select('name, phone')
+      .eq('id', tenant_id)
+      .single();
+
+    const message = await generatePaymentConfirmationMessage(
+      tenantData.name,
+      amount
+    );
+
+    await sendSMS(tenantData.phone, message, user_id);
+
+    const receipt = generateReceipt(
+      tenantData.name,
+      amount,
+      payment_date,
+      payment_method
+    );
+
+    res.json({
+      success: true,
+      payment: paymentData[0],
+      message,
+      receipt
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get payment history
+app.get('/api/payments/:tenant_id', async (req, res) => {
+  try {
+    const { tenant_id } = req.params;
+
+    const { data, error } = await supabase
+      .from('payments')
+      .select('*')
+      .eq('tenant_id', tenant_id)
+      .order('created_at', { ascending: false });
+
+    if (error) {
+      return res.status(400).json({ error: error.message });
+    }
+
+    res.json({ success: true, payments: data });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get all payments for property
+app.get('/api/payments/property/:property_id', async (req, res) => {
+  try {
+    const { property_id } = req.params;
+
+    // First get all tenant IDs for this property
+    const { data: tenants, error: tenantError } = await supabase
+      .from('tenants')
+      .select('id')
+      .eq('property_id', property_id);
+
+    if (tenantError) {
+      return res.status(400).json({ error: tenantError.message });
+    }
+
+    const tenantIds = tenants.map(t => t.id);
+
+    // Then get payments for those tenants
+    const { data, error } = await supabase
+      .from('payments')
+      .select('*, tenants(name, phone)')
+      .in('tenant_id', tenantIds)
+      .order('created_at', { ascending: false });
+
+    if (error) {
+      return res.status(400).json({ error: error.message });
+    }
+
+    res.json({ success: true, payments: data });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ============================================
+// SMS MESSAGING ROUTES
+// ============================================
+
+// Send SMS
+app.post('/api/sms/send', async (req, res) => {
+  try {
+    const { phone, message, user_id } = req.body;
+
+    const result = await sendSMS(phone, message, user_id);
+
+    res.json({
+      success: true,
+      message_sid: result.sid,
+      status: result.status
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get SMS inbox
+app.get('/api/sms/inbox/:user_id', async (req, res) => {
+  try {
+    const { user_id } = req.params;
+
+    const { data, error } = await supabase
+      .from('sms_messages')
+      .select('*')
+      .eq('user_id', user_id)
+      .order('created_at', { ascending: false });
+
+    if (error) {
+      return res.status(400).json({ error: error.message });
+    }
+
+    res.json({ success: true, messages: data });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ============================================
+// BILLING ROUTES
+// ============================================
+
+// Create subscription
+app.post('/api/billing/subscribe', async (req, res) => {
+  try {
+    const { customer_id, email, payment_method_id } = req.body;
+
+    const stripeCustomer = await stripe.customers.create({
+      email,
+      payment_method: payment_method_id,
+      invoice_settings: {
+        default_payment_method: payment_method_id
+      }
     });
 
-    return message.content[0].text;
+    const subscription = await stripe.subscriptions.create({
+      customer: stripeCustomer.id,
+      items: [{
+        price: process.env.STRIPE_PRICE_ID
+      }],
+      payment_settings: {
+        payment_method_types: ['card']
+      }
+    });
+
+    await supabase
+      .from('customers')
+      .update({
+        stripe_customer_id: stripeCustomer.id,
+        stripe_subscription_id: subscription.id,
+        subscription_status: 'active'
+      })
+      .eq('id', customer_id);
+
+    res.json({
+      success: true,
+      subscription: subscription,
+      client_secret: subscription.latest_invoice?.payment_intent?.client_secret
+    });
   } catch (error) {
-    console.error('Claude API error:', error);
-    throw error;
+    res.status(500).json({ error: error.message });
   }
+});
+
+// Get billing history
+app.get('/api/billing/invoices/:customer_id', async (req, res) => {
+  try {
+    const { customer_id } = req.params;
+
+    const { data: customer } = await supabase
+      .from('customers')
+      .select('stripe_customer_id')
+      .eq('id', customer_id)
+      .single();
+
+    if (!customer?.stripe_customer_id) {
+      return res.status(400).json({ error: 'No billing account found' });
+    }
+
+    const invoices = await stripe.invoices.list({
+      customer: customer.stripe_customer_id
+    });
+
+    res.json({ success: true, invoices: invoices.data });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Webhook for Stripe events
+app.post('/api/webhooks/stripe', express.raw({ type: 'application/json' }), async (req, res) => {
+  try {
+    const sig = req.headers['stripe-signature'];
+    const event = stripe.webhooks.constructEvent(
+      req.body,
+      sig,
+      process.env.STRIPE_WEBHOOK_SECRET
+    );
+
+    if (event.type === 'invoice.payment_succeeded') {
+      const invoice = event.data.object;
+      await supabase
+        .from('customers')
+        .update({ subscription_status: 'active' })
+        .eq('stripe_customer_id', invoice.customer);
+    }
+
+    if (event.type === 'invoice.payment_failed') {
+      const invoice = event.data.object;
+      await supabase
+        .from('customers')
+        .update({ subscription_status: 'past_due' })
+        .eq('stripe_customer_id', invoice.customer);
+    }
+
+    res.json({ received: true });
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
+});
+
+// ============================================
+// HELPER FUNCTIONS
+// ============================================
+
+async function generatePaymentConfirmationMessage(tenantName, amount) {
+  const message = await anthropic.messages.create({
+    model: 'claude-opus-5',
+    max_tokens: 100,
+    messages: [
+      {
+        role: 'user',
+        content: `Write a brief, friendly SMS confirmation message (under 160 characters) confirming a rent payment. Tenant name: ${tenantName}. Amount: $${amount}. Be warm and professional.`
+      }
+    ]
+  });
+
+  return message.content[0].text;
 }
 
-// Send SMS to tenant
-async function sendSMSToTenant(tenant, message) {
+async function sendSMS(phone, message, user_id) {
   try {
     const result = await twilioClient.messages.create({
       body: message,
       from: process.env.TWILIO_PHONE_NUMBER,
-      to: tenant.phone,
+      to: phone
     });
 
-    // Log in database
     await supabase
-      .from('messages')
+      .from('sms_messages')
       .insert([
         {
-          tenant_id: tenant.id,
-          message_type: 'sms',
-          body: message,
-          status: 'sent',
+          user_id,
+          to_phone: phone,
+          message,
+          status: result.status,
           twilio_sid: result.sid,
-          sent_at: new Date().toISOString(),
-        },
+          created_at: new Date()
+        }
       ]);
 
-    return result.sid;
+    return result;
   } catch (error) {
-    console.error('Twilio SMS error:', error);
+    console.error('SMS error:', error);
     throw error;
   }
 }
 
-// Trigger rent reminder
-app.post('/api/messages/send-rent-reminder', async (req, res) => {
+function generateReceipt(tenantName, amount, paymentDate, paymentMethod) {
+  return {
+    tenant_name: tenantName,
+    amount,
+    payment_date: paymentDate,
+    payment_method: paymentMethod,
+    receipt_number: `REC-${Date.now()}`,
+    timestamp: new Date()
+  };
+}
+
+// ============================================
+// DASHBOARD ROUTES
+// ============================================
+
+app.get('/api/dashboard/:user_id', async (req, res) => {
   try {
-    const { tenantId } = req.body;
-    
-    const { data: tenant, error } = await supabase
+    const { user_id } = req.params;
+
+    const { data: properties } = await supabase
+      .from('properties')
+      .select('*')
+      .eq('user_id', user_id);
+
+    const { data: tenants } = await supabase
       .from('tenants')
       .select('*')
-      .eq('id', tenantId)
-      .single();
-    
-    if (error) throw error;
+      .in('property_id', properties.map(p => p.id));
 
-    const message = await generateTenantMessage(tenant, 'rent_reminder');
-    const sid = await sendSMSToTenant(tenant, message);
-
-    res.json({ success: true, sid, message });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// ========== SCHEDULING (CRON) ==========
-
-// Run daily at 9 AM to send rent reminders
-cron.schedule('0 9 * * *', async () => {
-  try {
-    console.log('Running daily rent reminder scheduler...');
-    
-    // Get all tenants with rent due today
-    const today = new Date();
-    const dueDay = today.getDate();
-    
-    const { data: tenants, error } = await supabase
-      .from('tenants')
+    const startOfMonth = new Date(new Date().getFullYear(), new Date().getMonth(), 1);
+    const { data: payments } = await supabase
+      .from('payments')
       .select('*')
-      .eq('rent_due_day', dueDay)
-      .eq('active', true);
+      .gte('created_at', startOfMonth.toISOString());
 
-    if (error) throw error;
+    const totalExpected = properties.reduce((sum, p) => sum + (p.rent_amount || 0), 0);
+    const totalCollected = payments
+      .filter(p => p.status === 'paid')
+      .reduce((sum, p) => sum + (p.amount || 0), 0);
 
-    for (const tenant of tenants) {
-      try {
-        const message = await generateTenantMessage(tenant, 'rent_reminder');
-        await sendSMSToTenant(tenant, message);
-        console.log(`Sent reminder to ${tenant.name}`);
-      } catch (err) {
-        console.error(`Failed to send to ${tenant.name}:`, err.message);
-      }
-    }
-  } catch (err) {
-    console.error('Scheduler error:', err);
+    res.json({
+      success: true,
+      summary: {
+        total_properties: properties.length,
+        total_tenants: tenants.length,
+        total_expected_this_month: totalExpected,
+        total_collected_this_month: totalCollected,
+        pending_amount: totalExpected - totalCollected,
+        late_payments: payments.filter(p => p.status === 'late').length
+      },
+      properties,
+      tenants,
+      payments
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
   }
 });
 
-// ========== STRIPE WEBHOOK ==========
+// ============================================
+// HEALTH CHECK
+// ============================================
 
-// Verify Stripe signature (raw body middleware)
-app.post('/api/webhooks/stripe', express.raw({type: 'application/json'}), async (req, res) => {
-  const sig = req.headers['stripe-signature'];
-  
-  try {
-    const event = JSON.parse(req.body);
-    
-    // Verify signature (simplified - in production use Stripe client)
-    if (event.type === 'charge.succeeded') {
-      const { customer_email } = event.data.object;
-      
-      // Log successful payment
-      await supabase
-        .from('payments')
-        .insert([
-          {
-            stripe_charge_id: event.data.object.id,
-            amount: event.data.object.amount / 100,
-            customer_email,
-            created_at: new Date().toISOString(),
-          },
-        ]);
-    }
-    
-    res.json({ received: true });
-  } catch (err) {
-    res.status(400).json({ error: 'Webhook error' });
-  }
+app.get('/api/health', (req, res) => {
+  res.json({ status: 'ok', timestamp: new Date() });
 });
 
-// ========== HEALTH CHECK ==========
+// ============================================
+// ERROR HANDLING
+// ============================================
 
-app.get('/health', (req, res) => {
-  res.json({ status: 'ok', timestamp: new Date().toISOString() });
+app.use((err, req, res, next) => {
+  console.error(err);
+  res.status(500).json({ error: 'Internal server error' });
 });
 
+// ============================================
+// START SERVER
+// ============================================
+
+const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`Rental Assistant API running on port ${PORT}`);
+  console.log(`Rentflow backend running on port ${PORT}`);
 });
+
+module.exports = app;
