@@ -46,6 +46,52 @@ const anthropic = new Anthropic({
 });
 
 // ============================================
+// AUTH HELPERS
+// ============================================
+
+// Landlords who are allowed to see the Admin Dashboard.
+// Configure via ADMIN_EMAILS="a@x.com,b@y.com" in Railway; falls back to the founder account.
+const ADMIN_EMAILS = (process.env.ADMIN_EMAILS || 'bizstc456@gmail.com')
+  .split(',')
+  .map(e => e.trim().toLowerCase())
+  .filter(Boolean);
+
+// Verifies the Supabase access token sent as "Authorization: Bearer <token>"
+// and returns the authenticated user, or null if missing/invalid.
+async function getAuthenticatedUser(req) {
+  const authHeader = req.headers.authorization || '';
+  const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
+  if (!token) return null;
+
+  const { data, error } = await supabase.auth.getUser(token);
+  if (error || !data?.user) return null;
+  return data.user;
+}
+
+// Express middleware: requires a valid session, attaches req.user.
+async function requireAuth(req, res, next) {
+  const user = await getAuthenticatedUser(req);
+  if (!user) {
+    return res.status(401).json({ error: 'Missing or invalid session' });
+  }
+  req.user = user;
+  next();
+}
+
+// Express middleware: requires a valid session AND an admin email.
+async function requireAdmin(req, res, next) {
+  const user = await getAuthenticatedUser(req);
+  if (!user) {
+    return res.status(401).json({ error: 'Missing or invalid session' });
+  }
+  if (!ADMIN_EMAILS.includes((user.email || '').toLowerCase())) {
+    return res.status(403).json({ error: 'Admin access required' });
+  }
+  req.user = user;
+  next();
+}
+
+// ============================================
 // AUTHENTICATION ROUTES
 // ============================================
 
@@ -615,9 +661,14 @@ function generateReceipt(tenantName, amount, paymentDate, paymentMethod) {
 // DASHBOARD ROUTES
 // ============================================
 
-app.get('/api/dashboard/:user_id', async (req, res) => {
+app.get('/api/dashboard/:user_id', requireAuth, async (req, res) => {
   try {
     const { user_id } = req.params;
+
+    const isAdmin = ADMIN_EMAILS.includes((req.user.email || '').toLowerCase());
+    if (req.user.id !== user_id && !isAdmin) {
+      return res.status(403).json({ error: "Cannot view another user's dashboard" });
+    }
 
     const { data: properties } = await supabase
       .from('properties')
@@ -655,6 +706,49 @@ app.get('/api/dashboard/:user_id', async (req, res) => {
       payments
     });
   } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ============================================
+// ADMIN ROUTES
+// ============================================
+
+// Platform-wide stats + user list, for the Admin Dashboard only.
+// Uses the service-role client server-side -- this can never be called safely from the browser.
+app.get('/api/admin/stats', requireAdmin, async (req, res) => {
+  try {
+    const { data: usersPage, error: usersError } = await supabase.auth.admin.listUsers({ perPage: 200 });
+    if (usersError) throw usersError;
+
+    const { data: properties, error: propsError } = await supabase.from('properties').select('*');
+    if (propsError) throw propsError;
+
+    const { data: tenants, error: tenantsError } = await supabase.from('tenants').select('*');
+    if (tenantsError) throw tenantsError;
+
+    const { data: payments, error: paymentsError } = await supabase.from('payments').select('*');
+    if (paymentsError) throw paymentsError;
+
+    const users = usersPage.users.map(u => ({
+      id: u.id,
+      email: u.email,
+      created_at: u.created_at,
+      confirmed_at: u.email_confirmed_at,
+    }));
+
+    res.json({
+      success: true,
+      stats: {
+        totalUsers: users.length,
+        totalProperties: properties.length,
+        totalTenants: tenants.length,
+        totalRevenue: payments.reduce((sum, p) => sum + (p.amount || 0), 0),
+      },
+      users,
+    });
+  } catch (error) {
+    console.error('Admin stats error:', error);
     res.status(500).json({ error: error.message });
   }
 });
