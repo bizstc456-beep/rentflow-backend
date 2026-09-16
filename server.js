@@ -780,21 +780,58 @@ app.get('/api/dashboard/:user_id', requireAuth, async (req, res) => {
       .select('*')
       .eq('user_id', user_id);
 
+    const propertyIds = properties.map(p => p.id);
+
     const { data: tenants } = await supabase
       .from('tenants')
       .select('*')
-      .in('property_id', properties.map(p => p.id));
+      .in('property_id', propertyIds.length ? propertyIds : ['00000000-0000-0000-0000-000000000000']);
 
+    const tenantIds = tenants.map(t => t.id);
     const startOfMonth = new Date(new Date().getFullYear(), new Date().getMonth(), 1);
-    const { data: payments } = await supabase
-      .from('payments')
-      .select('*')
-      .gte('created_at', startOfMonth.toISOString());
 
+    // Only this landlord's own tenants' payments -- previously this summed every
+    // landlord's payments for the month, inflating everyone's "collected" total.
+    let payments = [];
+    if (tenantIds.length) {
+      const { data } = await supabase
+        .from('payments')
+        .select('*')
+        .in('tenant_id', tenantIds)
+        .gte('created_at', startOfMonth.toISOString());
+      payments = data || [];
+    }
+
+    // rent_amount and payment amounts are both stored in cents.
     const totalExpected = properties.reduce((sum, p) => sum + (p.rent_amount || 0), 0);
     const totalCollected = payments
       .filter(p => p.status === 'paid')
       .reduce((sum, p) => sum + (p.amount || 0), 0);
+
+    // Per-property collected/pending, so the dashboard can show each property's own status.
+    const tenantToProperty = {};
+    tenants.forEach(t => { tenantToProperty[t.id] = t.property_id; });
+
+    const collectedByProperty = {};
+    payments
+      .filter(p => p.status === 'paid')
+      .forEach(p => {
+        const propId = tenantToProperty[p.tenant_id];
+        if (!propId) return;
+        collectedByProperty[propId] = (collectedByProperty[propId] || 0) + (p.amount || 0);
+      });
+
+    const propertiesWithStatus = properties.map(p => {
+      const collected = collectedByProperty[p.id] || 0;
+      const expected = p.rent_amount || 0;
+      const pending = Math.max(expected - collected, 0);
+      return {
+        ...p,
+        collected_this_month: collected,
+        pending_amount: pending,
+        status: pending > 0 ? 'pending' : 'paid',
+      };
+    });
 
     res.json({
       success: true,
@@ -803,10 +840,10 @@ app.get('/api/dashboard/:user_id', requireAuth, async (req, res) => {
         total_tenants: tenants.length,
         total_expected_this_month: totalExpected,
         total_collected_this_month: totalCollected,
-        pending_amount: totalExpected - totalCollected,
+        pending_amount: Math.max(totalExpected - totalCollected, 0),
         late_payments: payments.filter(p => p.status === 'late').length
       },
-      properties,
+      properties: propertiesWithStatus,
       tenants,
       payments
     });
