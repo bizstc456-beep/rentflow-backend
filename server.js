@@ -728,6 +728,26 @@ app.get('/api/sms/inbox/:user_id', requireAuth, async (req, res) => {
   }
 });
 
+// SMS quick-action templates (Rent Due Reminder, Late Payment Notice,
+// Payment Received, etc.) -- shared across all landlords, not per-user, so
+// no ownership check is needed here.
+app.get('/api/sms/templates', requireAuth, async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('sms_templates')
+      .select('*')
+      .order('template_name', { ascending: true });
+
+    if (error) {
+      return res.status(400).json({ error: error.message });
+    }
+
+    res.json({ success: true, templates: data || [] });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // Twilio calls this when a tenant replies by SMS. Configure it as this number's
 // "A message comes in" webhook (Twilio Console -> Phone Numbers -> your number).
 app.post('/api/webhooks/twilio/inbound', express.urlencoded({ extended: false }), async (req, res) => {
