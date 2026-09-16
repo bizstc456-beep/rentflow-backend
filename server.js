@@ -9,6 +9,7 @@ const { createClient } = require('@supabase/supabase-js');
 const Stripe = require('stripe');
 const twilio = require('twilio');
 const Anthropic = require('@anthropic-ai/sdk');
+const multer = require('multer');
 
 // Load .env only in development, not in production (Railway)
 if (process.env.NODE_ENV !== 'production') {
@@ -44,6 +45,10 @@ const twilioClient = twilio(
 const anthropic = new Anthropic({
   apiKey: process.env.CLAUDE_API_KEY
 });
+
+// File uploads (documents) -- held in memory, then streamed to Supabase
+// Storage. 15MB cap covers scanned leases/IDs comfortably.
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 15 * 1024 * 1024 } });
 
 // ============================================
 // AUTH HELPERS
@@ -104,7 +109,7 @@ app.post('/api/auth/register', async (req, res) => {
       return res.status(400).json({ error: 'Missing required fields' });
     }
 
-    const { data: authData, error: authError } = await supabase.auth.signUpWithPassword({
+    const { data: authData, error: authError } = await supabase.auth.signUp({
       email,
       password
     });
@@ -270,6 +275,62 @@ app.put('/api/properties/:property_id', requireAuth, async (req, res) => {
   }
 });
 
+// Delete a property (and everything under it) you manage. Removes its
+// tenants' payments and documents, the tenants themselves, the property's
+// own documents, then the property. There's no undo -- the frontend confirms first.
+app.delete('/api/properties/:property_id', requireAuth, async (req, res) => {
+  try {
+    const { property_id } = req.params;
+
+    const { data: existing, error: fetchError } = await supabase
+      .from('properties')
+      .select('user_id')
+      .eq('id', property_id)
+      .single();
+    if (fetchError || !existing) {
+      return res.status(404).json({ error: 'Property not found' });
+    }
+
+    const isAdmin = ADMIN_EMAILS.includes((req.user.email || '').toLowerCase());
+    if (existing.user_id !== req.user.id && !isAdmin) {
+      return res.status(403).json({ error: 'You do not manage this property' });
+    }
+
+    const { data: tenants } = await supabase
+      .from('tenants')
+      .select('id')
+      .eq('property_id', property_id);
+    const tenantIds = (tenants || []).map(t => t.id);
+
+    const docFilter = tenantIds.length
+      ? `property_id.eq.${property_id},tenant_id.in.(${tenantIds.join(',')})`
+      : `property_id.eq.${property_id}`;
+    const { data: docs } = await supabase
+      .from('documents')
+      .select('storage_path')
+      .or(docFilter);
+    if (docs && docs.length) {
+      await supabase.storage.from(DOCUMENTS_BUCKET).remove(docs.map(d => d.storage_path));
+      await supabase.from('documents').delete().or(docFilter);
+    }
+
+    if (tenantIds.length) {
+      await supabase.from('payments').delete().in('tenant_id', tenantIds);
+    }
+
+    await supabase.from('tenants').delete().eq('property_id', property_id);
+
+    const { error } = await supabase.from('properties').delete().eq('id', property_id);
+    if (error) {
+      return res.status(400).json({ error: error.message });
+    }
+
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // ============================================
 // TENANT MANAGEMENT ROUTES
 // ============================================
@@ -366,6 +427,57 @@ app.put('/api/tenants/:tenant_id', requireAuth, async (req, res) => {
     }
 
     res.json({ success: true, tenant: data[0] });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Delete a tenant (lease ended / unit vacated) you manage. Cascades to that
+// tenant's payments and documents so nothing orphaned is left behind.
+app.delete('/api/tenants/:tenant_id', requireAuth, async (req, res) => {
+  try {
+    const { tenant_id } = req.params;
+
+    const { data: tenant, error: tenantError } = await supabase
+      .from('tenants')
+      .select('property_id')
+      .eq('id', tenant_id)
+      .single();
+    if (tenantError || !tenant) {
+      return res.status(404).json({ error: 'Tenant not found' });
+    }
+
+    const { data: property, error: propertyError } = await supabase
+      .from('properties')
+      .select('user_id')
+      .eq('id', tenant.property_id)
+      .single();
+    if (propertyError || !property) {
+      return res.status(404).json({ error: 'Property not found for this tenant' });
+    }
+
+    const isAdmin = ADMIN_EMAILS.includes((req.user.email || '').toLowerCase());
+    if (property.user_id !== req.user.id && !isAdmin) {
+      return res.status(403).json({ error: 'You do not manage this tenant' });
+    }
+
+    const { data: docs } = await supabase
+      .from('documents')
+      .select('storage_path')
+      .eq('tenant_id', tenant_id);
+    if (docs && docs.length) {
+      await supabase.storage.from(DOCUMENTS_BUCKET).remove(docs.map(d => d.storage_path));
+      await supabase.from('documents').delete().eq('tenant_id', tenant_id);
+    }
+
+    await supabase.from('payments').delete().eq('tenant_id', tenant_id);
+
+    const { error } = await supabase.from('tenants').delete().eq('id', tenant_id);
+    if (error) {
+      return res.status(400).json({ error: error.message });
+    }
+
+    res.json({ success: true });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -575,6 +687,193 @@ app.get('/api/payments/property/:property_id', requireAuth, async (req, res) => 
     }
 
     res.json({ success: true, payments: data });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ============================================
+// DOCUMENT MANAGEMENT ROUTES
+// ============================================
+// Files live in the private "documents" Supabase Storage bucket, one row per
+// file in the "documents" table. A document is attached to a tenant (lease,
+// ID copy, ...) or directly to a property (insurance policy, deed, ...),
+// never both at once.
+
+const DOCUMENTS_BUCKET = 'documents';
+
+// Returns the landlord user_id that owns this tenant/property, or null.
+async function resolveDocumentOwner(tenant_id, property_id) {
+  if (tenant_id) {
+    const { data: tenant } = await supabase
+      .from('tenants')
+      .select('property_id')
+      .eq('id', tenant_id)
+      .single();
+    if (!tenant) return null;
+    const { data: property } = await supabase
+      .from('properties')
+      .select('user_id')
+      .eq('id', tenant.property_id)
+      .single();
+    return property?.user_id || null;
+  }
+  if (property_id) {
+    const { data: property } = await supabase
+      .from('properties')
+      .select('user_id')
+      .eq('id', property_id)
+      .single();
+    return property?.user_id || null;
+  }
+  return null;
+}
+
+// Upload a document for a tenant or a property you manage.
+// multipart/form-data fields: file, and either tenant_id or property_id, plus optional category.
+app.post('/api/documents/upload', requireAuth, upload.single('file'), async (req, res) => {
+  try {
+    const { tenant_id, property_id, category } = req.body;
+    if (!req.file) {
+      return res.status(400).json({ error: 'No file uploaded' });
+    }
+    if (!tenant_id && !property_id) {
+      return res.status(400).json({ error: 'tenant_id or property_id is required' });
+    }
+
+    const ownerId = await resolveDocumentOwner(tenant_id, property_id);
+    const isAdmin = ADMIN_EMAILS.includes((req.user.email || '').toLowerCase());
+    if (!ownerId || (ownerId !== req.user.id && !isAdmin)) {
+      return res.status(403).json({ error: 'You do not manage this tenant or property' });
+    }
+
+    const safeName = req.file.originalname.replace(/[^a-zA-Z0-9.\-_]/g, '_');
+    const storagePath = `${req.user.id}/${tenant_id || property_id}/${Date.now()}-${safeName}`;
+
+    const { error: uploadError } = await supabase.storage
+      .from(DOCUMENTS_BUCKET)
+      .upload(storagePath, req.file.buffer, { contentType: req.file.mimetype });
+    if (uploadError) {
+      return res.status(400).json({ error: uploadError.message });
+    }
+
+    const { data, error } = await supabase
+      .from('documents')
+      .insert([{
+        user_id: req.user.id,
+        tenant_id: tenant_id || null,
+        property_id: property_id || null,
+        file_name: req.file.originalname,
+        storage_path: storagePath,
+        mime_type: req.file.mimetype,
+        file_size: req.file.size,
+        category: category || 'other',
+        created_at: new Date(),
+      }])
+      .select();
+
+    if (error) {
+      // Insert failed -- remove the file we just uploaded so storage never
+      // ends up with an orphaned object that has no matching row.
+      await supabase.storage.from(DOCUMENTS_BUCKET).remove([storagePath]);
+      return res.status(400).json({ error: error.message });
+    }
+
+    const { data: signed } = await supabase.storage
+      .from(DOCUMENTS_BUCKET)
+      .createSignedUrl(storagePath, 3600);
+
+    res.json({ success: true, document: { ...data[0], url: signed?.signedUrl || null } });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// List documents for a tenant you manage
+app.get('/api/documents/tenant/:tenant_id', requireAuth, async (req, res) => {
+  try {
+    const { tenant_id } = req.params;
+    const ownerId = await resolveDocumentOwner(tenant_id, null);
+    const isAdmin = ADMIN_EMAILS.includes((req.user.email || '').toLowerCase());
+    if (!ownerId || (ownerId !== req.user.id && !isAdmin)) {
+      return res.status(403).json({ error: "Cannot view another user's documents" });
+    }
+
+    const { data, error } = await supabase
+      .from('documents')
+      .select('*')
+      .eq('tenant_id', tenant_id)
+      .order('created_at', { ascending: false });
+    if (error) return res.status(400).json({ error: error.message });
+
+    const withUrls = await Promise.all((data || []).map(async (doc) => {
+      const { data: signed } = await supabase.storage
+        .from(DOCUMENTS_BUCKET)
+        .createSignedUrl(doc.storage_path, 3600);
+      return { ...doc, url: signed?.signedUrl || null };
+    }));
+
+    res.json({ success: true, documents: withUrls });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// List documents attached directly to a property you manage (building-level
+// docs only -- a tenant's own documents come from the route above).
+app.get('/api/documents/property/:property_id', requireAuth, async (req, res) => {
+  try {
+    const { property_id } = req.params;
+    const ownerId = await resolveDocumentOwner(null, property_id);
+    const isAdmin = ADMIN_EMAILS.includes((req.user.email || '').toLowerCase());
+    if (!ownerId || (ownerId !== req.user.id && !isAdmin)) {
+      return res.status(403).json({ error: "Cannot view another user's documents" });
+    }
+
+    const { data, error } = await supabase
+      .from('documents')
+      .select('*')
+      .eq('property_id', property_id)
+      .order('created_at', { ascending: false });
+    if (error) return res.status(400).json({ error: error.message });
+
+    const withUrls = await Promise.all((data || []).map(async (doc) => {
+      const { data: signed } = await supabase.storage
+        .from(DOCUMENTS_BUCKET)
+        .createSignedUrl(doc.storage_path, 3600);
+      return { ...doc, url: signed?.signedUrl || null };
+    }));
+
+    res.json({ success: true, documents: withUrls });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Delete a document you own
+app.delete('/api/documents/:document_id', requireAuth, async (req, res) => {
+  try {
+    const { document_id } = req.params;
+
+    const { data: doc, error: fetchError } = await supabase
+      .from('documents')
+      .select('*')
+      .eq('id', document_id)
+      .single();
+    if (fetchError || !doc) {
+      return res.status(404).json({ error: 'Document not found' });
+    }
+
+    const isAdmin = ADMIN_EMAILS.includes((req.user.email || '').toLowerCase());
+    if (doc.user_id !== req.user.id && !isAdmin) {
+      return res.status(403).json({ error: 'You do not manage this document' });
+    }
+
+    await supabase.storage.from(DOCUMENTS_BUCKET).remove([doc.storage_path]);
+    const { error } = await supabase.from('documents').delete().eq('id', document_id);
+    if (error) return res.status(400).json({ error: error.message });
+
+    res.json({ success: true });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
