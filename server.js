@@ -170,23 +170,27 @@ app.post('/api/auth/login', async (req, res) => {
 // ============================================
 
 // Create property
-app.post('/api/properties', async (req, res) => {
+app.post('/api/properties', requireAuth, async (req, res) => {
   try {
-    const { user_id, address, city, province, postal_code, property_type, rent_amount, bedrooms, bathrooms } = req.body;
+    const { address, city, province, postal_code, property_type, bedrooms, bathrooms, notes } = req.body;
+
+    if (!address || !city) {
+      return res.status(400).json({ error: 'Address and city are required' });
+    }
 
     const { data, error } = await supabase
       .from('properties')
       .insert([
         {
-          user_id,
+          user_id: req.user.id,
           address,
           city,
           province,
           postal_code,
           property_type,
-          rent_amount,
           bedrooms,
           bathrooms,
+          notes,
           created_at: new Date()
         }
       ])
@@ -202,15 +206,20 @@ app.post('/api/properties', async (req, res) => {
   }
 });
 
-// Get all properties for user
-app.get('/api/properties/:user_id', async (req, res) => {
+// Get all properties for a landlord
+app.get('/api/properties/:user_id', requireAuth, async (req, res) => {
   try {
     const { user_id } = req.params;
+    const isAdmin = ADMIN_EMAILS.includes((req.user.email || '').toLowerCase());
+    if (req.user.id !== user_id && !isAdmin) {
+      return res.status(403).json({ error: "Cannot view another user's properties" });
+    }
 
     const { data, error } = await supabase
       .from('properties')
       .select('*')
-      .eq('user_id', user_id);
+      .eq('user_id', user_id)
+      .order('created_at', { ascending: true });
 
     if (error) {
       return res.status(400).json({ error: error.message });
@@ -222,11 +231,28 @@ app.get('/api/properties/:user_id', async (req, res) => {
   }
 });
 
-// Update property
-app.put('/api/properties/:property_id', async (req, res) => {
+// Update a property you own. user_id is never accepted from the client --
+// ownership can't be transferred through this route.
+app.put('/api/properties/:property_id', requireAuth, async (req, res) => {
   try {
     const { property_id } = req.params;
-    const updates = req.body;
+
+    const { data: existing, error: fetchError } = await supabase
+      .from('properties')
+      .select('user_id')
+      .eq('id', property_id)
+      .single();
+    if (fetchError || !existing) {
+      return res.status(404).json({ error: 'Property not found' });
+    }
+
+    const isAdmin = ADMIN_EMAILS.includes((req.user.email || '').toLowerCase());
+    if (existing.user_id !== req.user.id && !isAdmin) {
+      return res.status(403).json({ error: 'You do not manage this property' });
+    }
+
+    const { address, city, province, postal_code, property_type, bedrooms, bathrooms, notes } = req.body;
+    const updates = { address, city, province, postal_code, property_type, bedrooms, bathrooms, notes };
 
     const { data, error } = await supabase
       .from('properties')
@@ -248,10 +274,28 @@ app.put('/api/properties/:property_id', async (req, res) => {
 // TENANT MANAGEMENT ROUTES
 // ============================================
 
-// Add tenant to property
-app.post('/api/tenants', async (req, res) => {
+// Add a tenant (a unit + its lease) to a property you own
+app.post('/api/tenants', requireAuth, async (req, res) => {
   try {
-    const { property_id, name, email, phone, lease_start_date, lease_end_date } = req.body;
+    const { property_id, name, email, phone, unit_label, rent_amount, lease_start_date, lease_end_date } = req.body;
+
+    if (!property_id || !name || !phone) {
+      return res.status(400).json({ error: 'property_id, name, and phone are required' });
+    }
+
+    const { data: property, error: propertyError } = await supabase
+      .from('properties')
+      .select('user_id')
+      .eq('id', property_id)
+      .single();
+    if (propertyError || !property) {
+      return res.status(404).json({ error: 'Property not found' });
+    }
+
+    const isAdmin = ADMIN_EMAILS.includes((req.user.email || '').toLowerCase());
+    if (property.user_id !== req.user.id && !isAdmin) {
+      return res.status(403).json({ error: 'You do not manage this property' });
+    }
 
     const { data, error } = await supabase
       .from('tenants')
@@ -261,6 +305,8 @@ app.post('/api/tenants', async (req, res) => {
           name,
           email,
           phone,
+          unit_label,
+          rent_amount,
           lease_start_date,
           lease_end_date,
           created_at: new Date()
@@ -278,10 +324,71 @@ app.post('/api/tenants', async (req, res) => {
   }
 });
 
-// Get tenants for property
-app.get('/api/tenants/:property_id', async (req, res) => {
+// Update a tenant/lease you manage
+app.put('/api/tenants/:tenant_id', requireAuth, async (req, res) => {
+  try {
+    const { tenant_id } = req.params;
+
+    const { data: tenant, error: tenantError } = await supabase
+      .from('tenants')
+      .select('property_id')
+      .eq('id', tenant_id)
+      .single();
+    if (tenantError || !tenant) {
+      return res.status(404).json({ error: 'Tenant not found' });
+    }
+
+    const { data: property, error: propertyError } = await supabase
+      .from('properties')
+      .select('user_id')
+      .eq('id', tenant.property_id)
+      .single();
+    if (propertyError || !property) {
+      return res.status(404).json({ error: 'Property not found for this tenant' });
+    }
+
+    const isAdmin = ADMIN_EMAILS.includes((req.user.email || '').toLowerCase());
+    if (property.user_id !== req.user.id && !isAdmin) {
+      return res.status(403).json({ error: 'You do not manage this tenant' });
+    }
+
+    const { name, email, phone, unit_label, rent_amount, lease_start_date, lease_end_date } = req.body;
+    const updates = { name, email, phone, unit_label, rent_amount, lease_start_date, lease_end_date };
+
+    const { data, error } = await supabase
+      .from('tenants')
+      .update(updates)
+      .eq('id', tenant_id)
+      .select();
+
+    if (error) {
+      return res.status(400).json({ error: error.message });
+    }
+
+    res.json({ success: true, tenant: data[0] });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get tenants for a single property you own
+app.get('/api/tenants/:property_id', requireAuth, async (req, res) => {
   try {
     const { property_id } = req.params;
+
+    const { data: property, error: propertyError } = await supabase
+      .from('properties')
+      .select('user_id')
+      .eq('id', property_id)
+      .single();
+    if (propertyError || !property) {
+      return res.status(404).json({ error: 'Property not found' });
+    }
+
+    const isAdmin = ADMIN_EMAILS.includes((req.user.email || '').toLowerCase());
+    if (property.user_id !== req.user.id && !isAdmin) {
+      return res.status(403).json({ error: "Cannot view another user's tenants" });
+    }
 
     const { data, error } = await supabase
       .from('tenants')
@@ -302,10 +409,37 @@ app.get('/api/tenants/:property_id', async (req, res) => {
 // PAYMENT TRACKING ROUTES
 // ============================================
 
-// Mark payment as paid
-app.post('/api/payments/mark-paid', async (req, res) => {
+// Mark a payment as paid for a tenant you manage
+app.post('/api/payments/mark-paid', requireAuth, async (req, res) => {
   try {
-    const { tenant_id, amount, payment_date, payment_method, user_id } = req.body;
+    const { tenant_id, amount, payment_date, payment_method } = req.body;
+
+    if (!tenant_id || !amount) {
+      return res.status(400).json({ error: 'tenant_id and amount are required' });
+    }
+
+    const { data: tenantData, error: tenantError } = await supabase
+      .from('tenants')
+      .select('name, phone, property_id')
+      .eq('id', tenant_id)
+      .single();
+    if (tenantError || !tenantData) {
+      return res.status(404).json({ error: 'Tenant not found' });
+    }
+
+    const { data: property, error: propertyError } = await supabase
+      .from('properties')
+      .select('user_id')
+      .eq('id', tenantData.property_id)
+      .single();
+    if (propertyError || !property) {
+      return res.status(404).json({ error: 'Property not found for this tenant' });
+    }
+
+    const isAdmin = ADMIN_EMAILS.includes((req.user.email || '').toLowerCase());
+    if (property.user_id !== req.user.id && !isAdmin) {
+      return res.status(403).json({ error: 'You do not manage this tenant' });
+    }
 
     const { data: paymentData, error: paymentError } = await supabase
       .from('payments')
@@ -325,18 +459,15 @@ app.post('/api/payments/mark-paid', async (req, res) => {
       return res.status(400).json({ error: paymentError.message });
     }
 
-    const { data: tenantData } = await supabase
-      .from('tenants')
-      .select('name, phone')
-      .eq('id', tenant_id)
-      .single();
-
-    const message = await generatePaymentConfirmationMessage(
-      tenantData.name,
-      amount
-    );
-
-    await sendSMS(tenantData.phone, message, user_id);
+    // A payment is already recorded at this point -- a failed confirmation
+    // text is logged but shouldn't make the request look like it failed.
+    let message = null;
+    try {
+      message = await generatePaymentConfirmationMessage(tenantData.name, amount);
+      await sendSMS(tenantData.phone, message, property.user_id);
+    } catch (smsError) {
+      console.error('Payment confirmation SMS failed:', smsError);
+    }
 
     const receipt = generateReceipt(
       tenantData.name,
@@ -356,10 +487,33 @@ app.post('/api/payments/mark-paid', async (req, res) => {
   }
 });
 
-// Get payment history
-app.get('/api/payments/:tenant_id', async (req, res) => {
+// Get payment history for a tenant you manage
+app.get('/api/payments/:tenant_id', requireAuth, async (req, res) => {
   try {
     const { tenant_id } = req.params;
+
+    const { data: tenantData, error: tenantError } = await supabase
+      .from('tenants')
+      .select('property_id')
+      .eq('id', tenant_id)
+      .single();
+    if (tenantError || !tenantData) {
+      return res.status(404).json({ error: 'Tenant not found' });
+    }
+
+    const { data: property, error: propertyError } = await supabase
+      .from('properties')
+      .select('user_id')
+      .eq('id', tenantData.property_id)
+      .single();
+    if (propertyError || !property) {
+      return res.status(404).json({ error: 'Property not found for this tenant' });
+    }
+
+    const isAdmin = ADMIN_EMAILS.includes((req.user.email || '').toLowerCase());
+    if (property.user_id !== req.user.id && !isAdmin) {
+      return res.status(403).json({ error: "Cannot view another user's payments" });
+    }
 
     const { data, error } = await supabase
       .from('payments')
@@ -377,12 +531,25 @@ app.get('/api/payments/:tenant_id', async (req, res) => {
   }
 });
 
-// Get all payments for property
-app.get('/api/payments/property/:property_id', async (req, res) => {
+// Get all payments for a property you own
+app.get('/api/payments/property/:property_id', requireAuth, async (req, res) => {
   try {
     const { property_id } = req.params;
 
-    // First get all tenant IDs for this property
+    const { data: property, error: propertyError } = await supabase
+      .from('properties')
+      .select('user_id')
+      .eq('id', property_id)
+      .single();
+    if (propertyError || !property) {
+      return res.status(404).json({ error: 'Property not found' });
+    }
+
+    const isAdmin = ADMIN_EMAILS.includes((req.user.email || '').toLowerCase());
+    if (property.user_id !== req.user.id && !isAdmin) {
+      return res.status(403).json({ error: "Cannot view another user's payments" });
+    }
+
     const { data: tenants, error: tenantError } = await supabase
       .from('tenants')
       .select('id')
@@ -393,8 +560,10 @@ app.get('/api/payments/property/:property_id', async (req, res) => {
     }
 
     const tenantIds = tenants.map(t => t.id);
+    if (tenantIds.length === 0) {
+      return res.json({ success: true, payments: [] });
+    }
 
-    // Then get payments for those tenants
     const { data, error } = await supabase
       .from('payments')
       .select('*, tenants(name, phone)')
@@ -441,7 +610,50 @@ app.get('/api/tenants/landlord/:user_id', requireAuth, async (req, res) => {
       .in('property_id', propertyIds);
     if (tenantsError) return res.status(400).json({ error: tenantsError.message });
 
-    res.json({ success: true, tenants: tenants || [] });
+    // Same per-tenant status/renewal computation as the dashboard route, so
+    // any screen listing tenants (Properties, Communication Center) can show
+    // paid/pending and "lease ends soon" without a second round trip.
+    const tenantIds = (tenants || []).map(t => t.id);
+    const startOfMonth = new Date(new Date().getFullYear(), new Date().getMonth(), 1);
+
+    let payments = [];
+    if (tenantIds.length) {
+      const { data } = await supabase
+        .from('payments')
+        .select('*')
+        .in('tenant_id', tenantIds)
+        .gte('created_at', startOfMonth.toISOString());
+      payments = data || [];
+    }
+
+    const collectedByTenant = {};
+    payments
+      .filter(p => p.status === 'paid')
+      .forEach(p => {
+        collectedByTenant[p.tenant_id] = (collectedByTenant[p.tenant_id] || 0) + (p.amount || 0);
+      });
+
+    const MS_PER_DAY = 24 * 60 * 60 * 1000;
+    const today = new Date();
+
+    const tenantsWithStatus = (tenants || []).map(t => {
+      const collected = collectedByTenant[t.id] || 0;
+      const expected = t.rent_amount || 0;
+      const pending = Math.max(expected - collected, 0);
+      const daysUntilLeaseEnd = t.lease_end_date
+        ? Math.ceil((new Date(t.lease_end_date) - today) / MS_PER_DAY)
+        : null;
+      return {
+        ...t,
+        collected_this_month: collected,
+        pending_amount: pending,
+        status: pending > 0 ? 'pending' : 'paid',
+        renewal_soon: daysUntilLeaseEnd !== null && daysUntilLeaseEnd >= 0 && daysUntilLeaseEnd <= 90,
+        days_until_lease_end: daysUntilLeaseEnd,
+      };
+    });
+
+    res.json({ success: true, tenants: tenantsWithStatus });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -802,36 +1014,66 @@ app.get('/api/dashboard/:user_id', requireAuth, async (req, res) => {
       payments = data || [];
     }
 
+    // Rent lives on the tenant/lease now, not the property -- a duplex or
+    // triplex has one rent per unit, not one for the whole building.
     // rent_amount and payment amounts are both stored in cents.
-    const totalExpected = properties.reduce((sum, p) => sum + (p.rent_amount || 0), 0);
+    const totalExpected = tenants.reduce((sum, t) => sum + (t.rent_amount || 0), 0);
     const totalCollected = payments
       .filter(p => p.status === 'paid')
       .reduce((sum, p) => sum + (p.amount || 0), 0);
 
-    // Per-property collected/pending, so the dashboard can show each property's own status.
-    const tenantToProperty = {};
-    tenants.forEach(t => { tenantToProperty[t.id] = t.property_id; });
-
-    const collectedByProperty = {};
+    // Per-tenant collected/pending, so each unit shows its own status.
+    const collectedByTenant = {};
     payments
       .filter(p => p.status === 'paid')
       .forEach(p => {
-        const propId = tenantToProperty[p.tenant_id];
-        if (!propId) return;
-        collectedByProperty[propId] = (collectedByProperty[propId] || 0) + (p.amount || 0);
+        collectedByTenant[p.tenant_id] = (collectedByTenant[p.tenant_id] || 0) + (p.amount || 0);
       });
 
+    const MS_PER_DAY = 24 * 60 * 60 * 1000;
+    const today = new Date();
+
+    const tenantsWithStatus = tenants.map(t => {
+      const collected = collectedByTenant[t.id] || 0;
+      const expected = t.rent_amount || 0;
+      const pending = Math.max(expected - collected, 0);
+      const daysUntilLeaseEnd = t.lease_end_date
+        ? Math.ceil((new Date(t.lease_end_date) - today) / MS_PER_DAY)
+        : null;
+      return {
+        ...t,
+        collected_this_month: collected,
+        pending_amount: pending,
+        status: pending > 0 ? 'pending' : 'paid',
+        // Quebec's lease non-renewal / rent-increase notice window opens
+        // 3-6 months before the lease ends -- flag inside 90 days so it's
+        // never missed by accident.
+        renewal_soon: daysUntilLeaseEnd !== null && daysUntilLeaseEnd >= 0 && daysUntilLeaseEnd <= 90,
+        days_until_lease_end: daysUntilLeaseEnd,
+      };
+    });
+
+    const tenantsByProperty = {};
+    tenantsWithStatus.forEach(t => {
+      if (!tenantsByProperty[t.property_id]) tenantsByProperty[t.property_id] = [];
+      tenantsByProperty[t.property_id].push(t);
+    });
+
     const propertiesWithStatus = properties.map(p => {
-      const collected = collectedByProperty[p.id] || 0;
-      const expected = p.rent_amount || 0;
+      const propTenants = tenantsByProperty[p.id] || [];
+      const collected = propTenants.reduce((sum, t) => sum + t.collected_this_month, 0);
+      const expected = propTenants.reduce((sum, t) => sum + (t.rent_amount || 0), 0);
       const pending = Math.max(expected - collected, 0);
       return {
         ...p,
+        tenants: propTenants,
         collected_this_month: collected,
         pending_amount: pending,
         status: pending > 0 ? 'pending' : 'paid',
       };
     });
+
+    const renewalsSoon = tenantsWithStatus.filter(t => t.renewal_soon);
 
     res.json({
       success: true,
@@ -841,10 +1083,12 @@ app.get('/api/dashboard/:user_id', requireAuth, async (req, res) => {
         total_expected_this_month: totalExpected,
         total_collected_this_month: totalCollected,
         pending_amount: Math.max(totalExpected - totalCollected, 0),
-        late_payments: payments.filter(p => p.status === 'late').length
+        late_payments: payments.filter(p => p.status === 'late').length,
+        leases_renewing_soon: renewalsSoon.length
       },
       properties: propertiesWithStatus,
-      tenants,
+      tenants: tenantsWithStatus,
+      renewals_soon: renewalsSoon,
       payments
     });
   } catch (error) {
