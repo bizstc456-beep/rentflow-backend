@@ -411,6 +411,49 @@ app.get('/api/sms/inbox/:user_id', async (req, res) => {
 // BILLING ROUTES
 // ============================================
 
+// Create a hosted Stripe Checkout session for the $150/mo plan with a 30-day trial.
+// Card is collected now (required to auto-convert to the paid plan after the trial),
+// but nothing is charged until the trial ends.
+app.post('/api/create-checkout-session', async (req, res) => {
+  try {
+    const { userId, email } = req.body;
+
+    if (!userId || !email) {
+      return res.status(400).json({ error: 'Missing userId or email' });
+    }
+
+    if (!process.env.STRIPE_PRICE_ID) {
+      return res.status(500).json({ error: 'STRIPE_PRICE_ID is not configured on the server' });
+    }
+
+    const frontendUrl = process.env.FRONTEND_URL || 'https://rentflow-frontend-phi.vercel.app';
+
+    const session = await stripe.checkout.sessions.create({
+      mode: 'subscription',
+      payment_method_types: ['card'],
+      customer_email: email,
+      line_items: [
+        {
+          price: process.env.STRIPE_PRICE_ID,
+          quantity: 1,
+        },
+      ],
+      subscription_data: {
+        trial_period_days: 30,
+        metadata: { user_id: userId },
+      },
+      metadata: { user_id: userId },
+      success_url: `${frontendUrl}/payment?checkout=success`,
+      cancel_url: `${frontendUrl}/payment?checkout=cancelled`,
+    });
+
+    res.json({ success: true, url: session.url, sessionId: session.id });
+  } catch (error) {
+    console.error('Create checkout session error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // Create subscription
 app.post('/api/billing/subscribe', async (req, res) => {
   try {
