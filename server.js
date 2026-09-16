@@ -415,27 +415,90 @@ app.get('/api/payments/property/:property_id', async (req, res) => {
 // SMS MESSAGING ROUTES
 // ============================================
 
-// Send SMS
-app.post('/api/sms/send', async (req, res) => {
+// Get all tenants across every property owned by a landlord (for the message-composer)
+app.get('/api/tenants/landlord/:user_id', requireAuth, async (req, res) => {
   try {
-    const { phone, message, user_id } = req.body;
+    const { user_id } = req.params;
+    const isAdmin = ADMIN_EMAILS.includes((req.user.email || '').toLowerCase());
+    if (req.user.id !== user_id && !isAdmin) {
+      return res.status(403).json({ error: "Cannot view another user's tenants" });
+    }
 
-    const result = await sendSMS(phone, message, user_id);
+    const { data: properties, error: propsError } = await supabase
+      .from('properties')
+      .select('id, address')
+      .eq('user_id', user_id);
+    if (propsError) return res.status(400).json({ error: propsError.message });
 
-    res.json({
-      success: true,
-      message_sid: result.sid,
-      status: result.status
-    });
+    const propertyIds = properties.map(p => p.id);
+    if (propertyIds.length === 0) {
+      return res.json({ success: true, tenants: [] });
+    }
+
+    const { data: tenants, error: tenantsError } = await supabase
+      .from('tenants')
+      .select('*')
+      .in('property_id', propertyIds);
+    if (tenantsError) return res.status(400).json({ error: tenantsError.message });
+
+    res.json({ success: true, tenants: tenants || [] });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
 });
 
-// Get SMS inbox
-app.get('/api/sms/inbox/:user_id', async (req, res) => {
+// Send an SMS to one of your own tenants
+app.post('/api/sms/send', requireAuth, async (req, res) => {
+  try {
+    const { tenant_id, message } = req.body;
+    if (!tenant_id || !message) {
+      return res.status(400).json({ error: 'Missing tenant_id or message' });
+    }
+
+    const { data: tenant, error: tenantError } = await supabase
+      .from('tenants')
+      .select('*')
+      .eq('id', tenant_id)
+      .single();
+    if (tenantError || !tenant) {
+      return res.status(404).json({ error: 'Tenant not found' });
+    }
+
+    const { data: property, error: propertyError } = await supabase
+      .from('properties')
+      .select('user_id')
+      .eq('id', tenant.property_id)
+      .single();
+    if (propertyError || !property) {
+      return res.status(404).json({ error: 'Property not found for this tenant' });
+    }
+
+    const isAdmin = ADMIN_EMAILS.includes((req.user.email || '').toLowerCase());
+    if (property.user_id !== req.user.id && !isAdmin) {
+      return res.status(403).json({ error: 'You do not manage this tenant' });
+    }
+
+    const result = await sendSMS(tenant.phone, message, property.user_id);
+
+    res.json({
+      success: true,
+      message_sid: result.sid,
+      status: result.status,
+    });
+  } catch (error) {
+    console.error('Send SMS error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get SMS history (sent + received) for a landlord
+app.get('/api/sms/inbox/:user_id', requireAuth, async (req, res) => {
   try {
     const { user_id } = req.params;
+    const isAdmin = ADMIN_EMAILS.includes((req.user.email || '').toLowerCase());
+    if (req.user.id !== user_id && !isAdmin) {
+      return res.status(403).json({ error: "Cannot view another user's messages" });
+    }
 
     const { data, error } = await supabase
       .from('sms_messages')
@@ -450,6 +513,48 @@ app.get('/api/sms/inbox/:user_id', async (req, res) => {
     res.json({ success: true, messages: data });
   } catch (error) {
     res.status(500).json({ error: error.message });
+  }
+});
+
+// Twilio calls this when a tenant replies by SMS. Configure it as this number's
+// "A message comes in" webhook (Twilio Console -> Phone Numbers -> your number).
+app.post('/api/webhooks/twilio/inbound', express.urlencoded({ extended: false }), async (req, res) => {
+  try {
+    const from = req.body.From;
+    const body = req.body.Body || '';
+    const messageSid = req.body.MessageSid;
+
+    const { data: tenant } = await supabase
+      .from('tenants')
+      .select('*')
+      .eq('phone', from)
+      .maybeSingle();
+
+    let userId = null;
+    if (tenant) {
+      const { data: property } = await supabase
+        .from('properties')
+        .select('user_id')
+        .eq('id', tenant.property_id)
+        .single();
+      userId = property?.user_id || null;
+    }
+
+    await supabase.from('sms_messages').insert([{
+      user_id: userId,
+      to_phone: from,
+      message: body,
+      status: 'received',
+      twilio_sid: messageSid,
+      created_at: new Date(),
+    }]);
+
+    res.set('Content-Type', 'text/xml');
+    res.send('<?xml version="1.0" encoding="UTF-8"?><Response></Response>');
+  } catch (error) {
+    console.error('Twilio inbound webhook error:', error);
+    res.set('Content-Type', 'text/xml');
+    res.status(500).send('<?xml version="1.0" encoding="UTF-8"?><Response></Response>');
   }
 });
 
