@@ -693,6 +693,301 @@ app.get('/api/payments/property/:property_id', requireAuth, async (req, res) => 
 });
 
 // ============================================
+// EXPENSE TRACKING ROUTES
+// ============================================
+// Expenses are property-level (repairs, insurance, taxes, mortgage,
+// utilities, management, other) and store user_id directly, unlike
+// tenants/payments -- so listing/ownership checks don't need a join back
+// through properties.
+
+const EXPENSE_CATEGORIES = ['repairs', 'insurance', 'taxes', 'mortgage', 'utilities', 'management', 'other'];
+
+// Add an expense for a property you own
+app.post('/api/expenses', requireAuth, async (req, res) => {
+  try {
+    const { property_id, category, amount, expense_date, notes } = req.body;
+
+    if (!property_id || !amount || !expense_date) {
+      return res.status(400).json({ error: 'property_id, amount, and expense_date are required' });
+    }
+
+    const { data: property, error: propertyError } = await supabase
+      .from('properties')
+      .select('user_id')
+      .eq('id', property_id)
+      .single();
+    if (propertyError || !property) {
+      return res.status(404).json({ error: 'Property not found' });
+    }
+
+    const isAdmin = ADMIN_EMAILS.includes((req.user.email || '').toLowerCase());
+    if (property.user_id !== req.user.id && !isAdmin) {
+      return res.status(403).json({ error: 'You do not manage this property' });
+    }
+
+    const safeCategory = EXPENSE_CATEGORIES.includes(category) ? category : 'other';
+
+    const { data, error } = await supabase
+      .from('expenses')
+      .insert([{
+        user_id: property.user_id,
+        property_id,
+        category: safeCategory,
+        amount,
+        expense_date,
+        notes: notes || null,
+        created_at: new Date(),
+      }])
+      .select();
+
+    if (error) {
+      return res.status(400).json({ error: error.message });
+    }
+
+    res.json({ success: true, expense: data[0] });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Update an expense you own
+app.put('/api/expenses/:expense_id', requireAuth, async (req, res) => {
+  try {
+    const { expense_id } = req.params;
+
+    const { data: existing, error: fetchError } = await supabase
+      .from('expenses')
+      .select('user_id')
+      .eq('id', expense_id)
+      .single();
+    if (fetchError || !existing) {
+      return res.status(404).json({ error: 'Expense not found' });
+    }
+
+    const isAdmin = ADMIN_EMAILS.includes((req.user.email || '').toLowerCase());
+    if (existing.user_id !== req.user.id && !isAdmin) {
+      return res.status(403).json({ error: 'You do not manage this expense' });
+    }
+
+    const { category, amount, expense_date, notes } = req.body;
+    const updates = {
+      category: EXPENSE_CATEGORIES.includes(category) ? category : 'other',
+      amount,
+      expense_date,
+      notes: notes || null,
+    };
+
+    const { data, error } = await supabase
+      .from('expenses')
+      .update(updates)
+      .eq('id', expense_id)
+      .select();
+
+    if (error) {
+      return res.status(400).json({ error: error.message });
+    }
+
+    res.json({ success: true, expense: data[0] });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Delete an expense you own
+app.delete('/api/expenses/:expense_id', requireAuth, async (req, res) => {
+  try {
+    const { expense_id } = req.params;
+
+    const { data: existing, error: fetchError } = await supabase
+      .from('expenses')
+      .select('user_id')
+      .eq('id', expense_id)
+      .single();
+    if (fetchError || !existing) {
+      return res.status(404).json({ error: 'Expense not found' });
+    }
+
+    const isAdmin = ADMIN_EMAILS.includes((req.user.email || '').toLowerCase());
+    if (existing.user_id !== req.user.id && !isAdmin) {
+      return res.status(403).json({ error: 'You do not manage this expense' });
+    }
+
+    const { error } = await supabase.from('expenses').delete().eq('id', expense_id);
+    if (error) {
+      return res.status(400).json({ error: error.message });
+    }
+
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// All expenses for a landlord, across every property (used by the Reports page)
+app.get('/api/expenses/landlord/:user_id', requireAuth, async (req, res) => {
+  try {
+    const { user_id } = req.params;
+    const isAdmin = ADMIN_EMAILS.includes((req.user.email || '').toLowerCase());
+    if (req.user.id !== user_id && !isAdmin) {
+      return res.status(403).json({ error: "Cannot view another user's expenses" });
+    }
+
+    const { data, error } = await supabase
+      .from('expenses')
+      .select('*')
+      .eq('user_id', user_id)
+      .order('expense_date', { ascending: false });
+
+    if (error) {
+      return res.status(400).json({ error: error.message });
+    }
+
+    res.json({ success: true, expenses: data || [] });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Expenses for a single property you own
+app.get('/api/expenses/property/:property_id', requireAuth, async (req, res) => {
+  try {
+    const { property_id } = req.params;
+
+    const { data: property, error: propertyError } = await supabase
+      .from('properties')
+      .select('user_id')
+      .eq('id', property_id)
+      .single();
+    if (propertyError || !property) {
+      return res.status(404).json({ error: 'Property not found' });
+    }
+
+    const isAdmin = ADMIN_EMAILS.includes((req.user.email || '').toLowerCase());
+    if (property.user_id !== req.user.id && !isAdmin) {
+      return res.status(403).json({ error: "Cannot view another user's expenses" });
+    }
+
+    const { data, error } = await supabase
+      .from('expenses')
+      .select('*')
+      .eq('property_id', property_id)
+      .order('expense_date', { ascending: false });
+
+    if (error) {
+      return res.status(400).json({ error: error.message });
+    }
+
+    res.json({ success: true, expenses: data || [] });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ============================================
+// REPORTING ROUTES
+// ============================================
+// Income/expense report for a date range -- real money in and real money
+// out only (paid payments, recorded expenses). Deliberately doesn't try to
+// project "expected" rent over an arbitrary range (that gets fuzzy fast once
+// tenants move in/out mid-range); the Dashboard's current-month numbers
+// already cover "expected vs collected" for the present month.
+app.get('/api/reports/:user_id', requireAuth, async (req, res) => {
+  try {
+    const { user_id } = req.params;
+    const isAdmin = ADMIN_EMAILS.includes((req.user.email || '').toLowerCase());
+    if (req.user.id !== user_id && !isAdmin) {
+      return res.status(403).json({ error: "Cannot view another user's reports" });
+    }
+
+    const today = new Date();
+    const defaultStart = new Date(today.getFullYear(), 0, 1).toISOString().slice(0, 10);
+    const defaultEnd = today.toISOString().slice(0, 10);
+    const start = req.query.start || defaultStart;
+    const end = req.query.end || defaultEnd;
+
+    const { data: properties, error: propsError } = await supabase
+      .from('properties')
+      .select('id, address')
+      .eq('user_id', user_id);
+    if (propsError) return res.status(400).json({ error: propsError.message });
+
+    const propertyIds = properties.map(p => p.id);
+
+    const { data: tenants } = await supabase
+      .from('tenants')
+      .select('id, property_id')
+      .in('property_id', propertyIds.length ? propertyIds : ['00000000-0000-0000-0000-000000000000']);
+
+    const tenantToProperty = {};
+    (tenants || []).forEach(t => { tenantToProperty[t.id] = t.property_id; });
+    const tenantIds = (tenants || []).map(t => t.id);
+
+    let payments = [];
+    if (tenantIds.length) {
+      const { data } = await supabase
+        .from('payments')
+        .select('*')
+        .in('tenant_id', tenantIds)
+        .eq('status', 'paid')
+        .gte('payment_date', start)
+        .lte('payment_date', end);
+      payments = data || [];
+    }
+
+    const { data: expensesData } = await supabase
+      .from('expenses')
+      .select('*')
+      .eq('user_id', user_id)
+      .gte('expense_date', start)
+      .lte('expense_date', end);
+    const expenses = expensesData || [];
+
+    const incomeByProperty = {};
+    payments.forEach(p => {
+      const propertyId = tenantToProperty[p.tenant_id];
+      if (!propertyId) return;
+      incomeByProperty[propertyId] = (incomeByProperty[propertyId] || 0) + (p.amount || 0);
+    });
+
+    const expensesByProperty = {};
+    const expensesByCategory = {};
+    expenses.forEach(e => {
+      expensesByProperty[e.property_id] = (expensesByProperty[e.property_id] || 0) + (e.amount || 0);
+      expensesByCategory[e.category] = (expensesByCategory[e.category] || 0) + (e.amount || 0);
+    });
+
+    const propertyReports = properties.map(p => {
+      const income = incomeByProperty[p.id] || 0;
+      const propertyExpenses = expensesByProperty[p.id] || 0;
+      return {
+        id: p.id,
+        address: p.address,
+        income,
+        expenses: propertyExpenses,
+        net: income - propertyExpenses,
+      };
+    });
+
+    const totalIncome = payments.reduce((sum, p) => sum + (p.amount || 0), 0);
+    const totalExpenses = expenses.reduce((sum, e) => sum + (e.amount || 0), 0);
+
+    res.json({
+      success: true,
+      range: { start, end },
+      summary: {
+        income: totalIncome,
+        expenses: totalExpenses,
+        net: totalIncome - totalExpenses,
+      },
+      expenses_by_category: Object.entries(expensesByCategory).map(([category, amount]) => ({ category, amount })),
+      properties: propertyReports,
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ============================================
 // DOCUMENT MANAGEMENT ROUTES
 // ============================================
 // Files live in the private "documents" Supabase Storage bucket, one row per
