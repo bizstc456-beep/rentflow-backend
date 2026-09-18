@@ -96,6 +96,30 @@ async function requireAdmin(req, res, next) {
   next();
 }
 
+// Express middleware: requires a valid session that is linked to a tenant
+// record (tenants.auth_user_id), for the tenant self-service portal.
+// Attaches the tenant row as req.tenant.
+async function requireTenantAuth(req, res, next) {
+  const user = await getAuthenticatedUser(req);
+  if (!user) {
+    return res.status(401).json({ error: 'Missing or invalid session' });
+  }
+
+  const { data: tenant, error } = await supabase
+    .from('tenants')
+    .select('*')
+    .eq('auth_user_id', user.id)
+    .single();
+
+  if (error || !tenant) {
+    return res.status(403).json({ error: 'No tenant portal account is linked to this login' });
+  }
+
+  req.user = user;
+  req.tenant = tenant;
+  next();
+}
+
 // ============================================
 // AUTHENTICATION ROUTES
 // ============================================
@@ -1169,6 +1193,271 @@ app.delete('/api/documents/:document_id', requireAuth, async (req, res) => {
     if (error) return res.status(400).json({ error: error.message });
 
     res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ============================================
+// TENANT PORTAL & MAINTENANCE ROUTES
+// ============================================
+// Tenants get invite-only accounts (landlord triggers a Supabase invite
+// email; the tenant sets a password and logs in with email+password from
+// then on -- same recovery-link pattern as the landlord forgot-password
+// flow). A tenant's Supabase auth user is linked back to their tenants row
+// via tenants.auth_user_id. v1 scope is view-only lease/payment info plus
+// maintenance request submission -- no in-portal payments yet.
+
+const MAINTENANCE_STATUSES = ['open', 'in_progress', 'resolved'];
+
+// Invite a tenant you manage to create their portal login
+app.post('/api/tenants/:tenant_id/invite', requireAuth, async (req, res) => {
+  try {
+    const { tenant_id } = req.params;
+
+    const { data: tenant, error: tenantError } = await supabase
+      .from('tenants')
+      .select('*')
+      .eq('id', tenant_id)
+      .single();
+    if (tenantError || !tenant) {
+      return res.status(404).json({ error: 'Tenant not found' });
+    }
+
+    const { data: property, error: propertyError } = await supabase
+      .from('properties')
+      .select('user_id')
+      .eq('id', tenant.property_id)
+      .single();
+    if (propertyError || !property) {
+      return res.status(404).json({ error: 'Property not found for this tenant' });
+    }
+
+    const isAdmin = ADMIN_EMAILS.includes((req.user.email || '').toLowerCase());
+    if (property.user_id !== req.user.id && !isAdmin) {
+      return res.status(403).json({ error: 'You do not manage this tenant' });
+    }
+
+    if (!tenant.email) {
+      return res.status(400).json({ error: 'Add an email address for this tenant before inviting them' });
+    }
+    if (tenant.auth_user_id) {
+      return res.status(400).json({ error: 'This tenant already has a portal account' });
+    }
+
+    const frontendUrl = process.env.FRONTEND_URL || 'https://rentflow-frontend-phi.vercel.app';
+
+    const { data: inviteData, error: inviteError } = await supabase.auth.admin.inviteUserByEmail(
+      tenant.email,
+      { redirectTo: `${frontendUrl}/tenant/set-password` }
+    );
+
+    if (inviteError) {
+      return res.status(400).json({ error: inviteError.message });
+    }
+
+    const { error: updateError } = await supabase
+      .from('tenants')
+      .update({ auth_user_id: inviteData.user.id, invited_at: new Date() })
+      .eq('id', tenant_id);
+
+    if (updateError) {
+      return res.status(400).json({ error: updateError.message });
+    }
+
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Tenant portal: my lease/rental info
+app.get('/api/tenant-portal/me', requireTenantAuth, async (req, res) => {
+  try {
+    const { data: property, error: propertyError } = await supabase
+      .from('properties')
+      .select('address')
+      .eq('id', req.tenant.property_id)
+      .single();
+    if (propertyError || !property) {
+      return res.status(404).json({ error: 'Property not found' });
+    }
+
+    res.json({ success: true, tenant: req.tenant, property });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Tenant portal: my payment history + current balance
+app.get('/api/tenant-portal/payments', requireTenantAuth, async (req, res) => {
+  try {
+    const { data: payments, error } = await supabase
+      .from('payments')
+      .select('*')
+      .eq('tenant_id', req.tenant.id)
+      .order('created_at', { ascending: false });
+
+    if (error) {
+      return res.status(400).json({ error: error.message });
+    }
+
+    // Same current-month balance math used on the landlord's tenant list,
+    // so "amount due" here always matches what the landlord sees.
+    const startOfMonth = new Date(new Date().getFullYear(), new Date().getMonth(), 1);
+    const collectedThisMonth = (payments || [])
+      .filter(p => p.status === 'paid' && new Date(p.created_at) >= startOfMonth)
+      .reduce((sum, p) => sum + (p.amount || 0), 0);
+    const expected = req.tenant.rent_amount || 0;
+    const pending = Math.max(expected - collectedThisMonth, 0);
+
+    res.json({
+      success: true,
+      payments,
+      balance: {
+        rent_amount: expected,
+        collected_this_month: collectedThisMonth,
+        pending_amount: pending,
+        status: pending > 0 ? 'pending' : 'paid',
+      },
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Tenant portal: my maintenance requests
+app.get('/api/tenant-portal/maintenance', requireTenantAuth, async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('maintenance_requests')
+      .select('*')
+      .eq('tenant_id', req.tenant.id)
+      .order('created_at', { ascending: false });
+
+    if (error) {
+      return res.status(400).json({ error: error.message });
+    }
+
+    res.json({ success: true, requests: data });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Tenant portal: submit a new maintenance request
+app.post('/api/tenant-portal/maintenance', requireTenantAuth, async (req, res) => {
+  try {
+    const { title, description } = req.body;
+    if (!title) {
+      return res.status(400).json({ error: 'title is required' });
+    }
+
+    const { data, error } = await supabase
+      .from('maintenance_requests')
+      .insert([
+        {
+          tenant_id: req.tenant.id,
+          property_id: req.tenant.property_id,
+          title,
+          description: description || '',
+          status: 'open',
+          created_at: new Date(),
+          updated_at: new Date(),
+        },
+      ])
+      .select();
+
+    if (error) {
+      return res.status(400).json({ error: error.message });
+    }
+
+    res.json({ success: true, request: data[0] });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Landlord view: all maintenance requests across your properties
+app.get('/api/maintenance/landlord/:user_id', requireAuth, async (req, res) => {
+  try {
+    const { user_id } = req.params;
+    const isAdmin = ADMIN_EMAILS.includes((req.user.email || '').toLowerCase());
+    if (req.user.id !== user_id && !isAdmin) {
+      return res.status(403).json({ error: "Cannot view another user's maintenance requests" });
+    }
+
+    const { data: properties, error: propsError } = await supabase
+      .from('properties')
+      .select('id, address')
+      .eq('user_id', user_id);
+    if (propsError) return res.status(400).json({ error: propsError.message });
+
+    const propertyIds = properties.map(p => p.id);
+    if (propertyIds.length === 0) {
+      return res.json({ success: true, requests: [] });
+    }
+
+    const { data: requests, error } = await supabase
+      .from('maintenance_requests')
+      .select('*, tenants(name, unit_label), properties(address)')
+      .in('property_id', propertyIds)
+      .order('created_at', { ascending: false });
+
+    if (error) {
+      return res.status(400).json({ error: error.message });
+    }
+
+    res.json({ success: true, requests });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Landlord: update a maintenance request's status
+app.put('/api/maintenance/:request_id', requireAuth, async (req, res) => {
+  try {
+    const { request_id } = req.params;
+    const { status } = req.body;
+
+    if (!MAINTENANCE_STATUSES.includes(status)) {
+      return res.status(400).json({ error: `status must be one of: ${MAINTENANCE_STATUSES.join(', ')}` });
+    }
+
+    const { data: request, error: requestError } = await supabase
+      .from('maintenance_requests')
+      .select('property_id')
+      .eq('id', request_id)
+      .single();
+    if (requestError || !request) {
+      return res.status(404).json({ error: 'Maintenance request not found' });
+    }
+
+    const { data: property, error: propertyError } = await supabase
+      .from('properties')
+      .select('user_id')
+      .eq('id', request.property_id)
+      .single();
+    if (propertyError || !property) {
+      return res.status(404).json({ error: 'Property not found for this request' });
+    }
+
+    const isAdmin = ADMIN_EMAILS.includes((req.user.email || '').toLowerCase());
+    if (property.user_id !== req.user.id && !isAdmin) {
+      return res.status(403).json({ error: 'You do not manage this property' });
+    }
+
+    const { data, error } = await supabase
+      .from('maintenance_requests')
+      .update({ status, updated_at: new Date() })
+      .eq('id', request_id)
+      .select();
+
+    if (error) {
+      return res.status(400).json({ error: error.message });
+    }
+
+    res.json({ success: true, request: data[0] });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
