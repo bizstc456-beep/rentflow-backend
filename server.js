@@ -1391,13 +1391,13 @@ app.post('/api/webhooks/twilio/inbound', express.urlencoded({ extended: false })
 // Create a hosted Stripe Checkout session for the $150/mo plan with a 30-day trial.
 // Card is collected now (required to auto-convert to the paid plan after the trial),
 // but nothing is charged until the trial ends.
-app.post('/api/create-checkout-session', async (req, res) => {
+app.post('/api/create-checkout-session', requireAuth, async (req, res) => {
   try {
-    const { userId, email } = req.body;
-
-    if (!userId || !email) {
-      return res.status(400).json({ error: 'Missing userId or email' });
-    }
+    // Identity comes from the verified session, never the request body --
+    // otherwise anyone could start a trial checkout tagged with someone
+    // else's user id.
+    const userId = req.user.id;
+    const email = req.user.email;
 
     if (!process.env.STRIPE_PRICE_ID) {
       return res.status(500).json({ error: 'STRIPE_PRICE_ID is not configured on the server' });
@@ -1432,9 +1432,27 @@ app.post('/api/create-checkout-session', async (req, res) => {
 });
 
 // Create subscription
-app.post('/api/billing/subscribe', async (req, res) => {
+app.post('/api/billing/subscribe', requireAuth, async (req, res) => {
   try {
     const { customer_id, email, payment_method_id } = req.body;
+
+    if (!customer_id || !payment_method_id) {
+      return res.status(400).json({ error: 'customer_id and payment_method_id are required' });
+    }
+
+    const { data: customerRow, error: customerLookupError } = await supabase
+      .from('customers')
+      .select('user_id')
+      .eq('id', customer_id)
+      .single();
+    if (customerLookupError || !customerRow) {
+      return res.status(404).json({ error: 'Customer not found' });
+    }
+
+    const isAdmin = ADMIN_EMAILS.includes((req.user.email || '').toLowerCase());
+    if (customerRow.user_id !== req.user.id && !isAdmin) {
+      return res.status(403).json({ error: 'This billing account does not belong to you' });
+    }
 
     const stripeCustomer = await stripe.customers.create({
       email,
@@ -1474,18 +1492,23 @@ app.post('/api/billing/subscribe', async (req, res) => {
 });
 
 // Get billing history
-app.get('/api/billing/invoices/:customer_id', async (req, res) => {
+app.get('/api/billing/invoices/:customer_id', requireAuth, async (req, res) => {
   try {
     const { customer_id } = req.params;
 
     const { data: customer } = await supabase
       .from('customers')
-      .select('stripe_customer_id')
+      .select('stripe_customer_id, user_id')
       .eq('id', customer_id)
       .single();
 
     if (!customer?.stripe_customer_id) {
       return res.status(400).json({ error: 'No billing account found' });
+    }
+
+    const isAdmin = ADMIN_EMAILS.includes((req.user.email || '').toLowerCase());
+    if (customer.user_id !== req.user.id && !isAdmin) {
+      return res.status(403).json({ error: 'This billing account does not belong to you' });
     }
 
     const invoices = await stripe.invoices.list({
