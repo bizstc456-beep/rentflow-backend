@@ -359,6 +359,13 @@ app.delete('/api/properties/:property_id', requireAuth, async (req, res) => {
 // TENANT MANAGEMENT ROUTES
 // ============================================
 
+// Postgres rejects '' for a date column -- the lease-date fields come from
+// optional <input type="date"> elements, which send '' when left blank.
+// Normalize those (and undefined/null) to a real null before they hit the DB.
+function toNullableDate(value) {
+  return value ? value : null;
+}
+
 // Add a tenant (a unit + its lease) to a property you own
 app.post('/api/tenants', requireAuth, async (req, res) => {
   try {
@@ -392,8 +399,8 @@ app.post('/api/tenants', requireAuth, async (req, res) => {
           phone,
           unit_label,
           rent_amount,
-          lease_start_date,
-          lease_end_date,
+          lease_start_date: toNullableDate(lease_start_date),
+          lease_end_date: toNullableDate(lease_end_date),
           created_at: new Date()
         }
       ])
@@ -438,7 +445,15 @@ app.put('/api/tenants/:tenant_id', requireAuth, async (req, res) => {
     }
 
     const { name, email, phone, unit_label, rent_amount, lease_start_date, lease_end_date } = req.body;
-    const updates = { name, email, phone, unit_label, rent_amount, lease_start_date, lease_end_date };
+    const updates = {
+      name,
+      email,
+      phone,
+      unit_label,
+      rent_amount,
+      lease_start_date: toNullableDate(lease_start_date),
+      lease_end_date: toNullableDate(lease_end_date),
+    };
 
     const { data, error } = await supabase
       .from('tenants')
