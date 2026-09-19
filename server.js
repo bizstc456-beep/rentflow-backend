@@ -1479,6 +1479,206 @@ app.put('/api/maintenance/:request_id', requireAuth, async (req, res) => {
 });
 
 // ============================================
+// LEASE RENEWAL ALERTS
+// ============================================
+// Quebec's Tribunal administratif du logement (TAL) requires landlords to
+// give notice of a rent increase or other lease change within a fixed
+// window before the lease ends, or the lease renews automatically on its
+// existing terms. The window is 3-6 months before the end date for a lease
+// of 12 months or more, and 1-2 months before the end date for a shorter
+// fixed term. This is a general-reference calculation to flag upcoming
+// deadlines, not legal advice -- confirm exact requirements for your
+// situation before acting on it.
+
+function addMonths(date, n) {
+  const d = new Date(date);
+  d.setMonth(d.getMonth() + n);
+  return d;
+}
+
+function monthsBetween(start, end) {
+  const s = new Date(start);
+  const e = new Date(end);
+  return (e.getFullYear() - s.getFullYear()) * 12 + (e.getMonth() - s.getMonth());
+}
+
+function computeRenewalWindow(tenant) {
+  if (!tenant.lease_end_date) return null;
+
+  const end = new Date(tenant.lease_end_date);
+  // Unknown lease start -- default to the standard (>= 12 month) bracket,
+  // the most common case for a residential lease in Quebec.
+  const durationMonths = tenant.lease_start_date
+    ? monthsBetween(tenant.lease_start_date, tenant.lease_end_date)
+    : 12;
+  const isStandardTerm = durationMonths >= 12;
+
+  const windowStart = isStandardTerm ? addMonths(end, -6) : addMonths(end, -2);
+  const windowEnd = isStandardTerm ? addMonths(end, -3) : addMonths(end, -1);
+
+  const today = new Date();
+  let status;
+  if (today < windowStart) status = 'upcoming';
+  else if (today <= windowEnd) status = 'in_window';
+  else if (today <= end) status = 'window_passed';
+  else status = 'lease_ended';
+
+  const MS_PER_DAY = 24 * 60 * 60 * 1000;
+
+  return {
+    bracket: isStandardTerm ? '3-6 months before lease end' : '1-2 months before lease end',
+    window_start: windowStart.toISOString().slice(0, 10),
+    window_end: windowEnd.toISOString().slice(0, 10),
+    status,
+    days_until_window_opens: Math.ceil((windowStart - today) / MS_PER_DAY),
+    days_until_window_closes: Math.ceil((windowEnd - today) / MS_PER_DAY),
+  };
+}
+
+// Landlord view: every tenant with a lease end date, annotated with their
+// TAL notice window and where they stand in it.
+app.get('/api/lease-renewals/landlord/:user_id', requireAuth, async (req, res) => {
+  try {
+    const { user_id } = req.params;
+    const isAdmin = ADMIN_EMAILS.includes((req.user.email || '').toLowerCase());
+    if (req.user.id !== user_id && !isAdmin) {
+      return res.status(403).json({ error: "Cannot view another user's lease renewals" });
+    }
+
+    const { data: properties, error: propsError } = await supabase
+      .from('properties')
+      .select('id, address')
+      .eq('user_id', user_id);
+    if (propsError) return res.status(400).json({ error: propsError.message });
+
+    const propertyById = {};
+    (properties || []).forEach(p => { propertyById[p.id] = p; });
+    const propertyIds = properties.map(p => p.id);
+    if (propertyIds.length === 0) {
+      return res.json({ success: true, renewals: [] });
+    }
+
+    const { data: tenants, error: tenantsError } = await supabase
+      .from('tenants')
+      .select('*')
+      .in('property_id', propertyIds)
+      .not('lease_end_date', 'is', null);
+    if (tenantsError) return res.status(400).json({ error: tenantsError.message });
+
+    const renewals = (tenants || [])
+      .map(t => {
+        const window = computeRenewalWindow(t);
+        if (!window) return null;
+        return {
+          tenant_id: t.id,
+          tenant_name: t.name,
+          unit_label: t.unit_label,
+          property_id: t.property_id,
+          property_address: propertyById[t.property_id]?.address || null,
+          lease_start_date: t.lease_start_date,
+          lease_end_date: t.lease_end_date,
+          renewal_notice_sent_at: t.renewal_notice_sent_at,
+          ...window,
+        };
+      })
+      .filter(Boolean)
+      .sort((a, b) => new Date(a.window_start) - new Date(b.window_start));
+
+    res.json({ success: true, renewals });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Landlord: mark that you've sent the renewal/rent-change notice for a tenant
+app.post('/api/tenants/:tenant_id/renewal-notice-sent', requireAuth, async (req, res) => {
+  try {
+    const { tenant_id } = req.params;
+
+    const { data: tenant, error: tenantError } = await supabase
+      .from('tenants')
+      .select('property_id')
+      .eq('id', tenant_id)
+      .single();
+    if (tenantError || !tenant) {
+      return res.status(404).json({ error: 'Tenant not found' });
+    }
+
+    const { data: property, error: propertyError } = await supabase
+      .from('properties')
+      .select('user_id')
+      .eq('id', tenant.property_id)
+      .single();
+    if (propertyError || !property) {
+      return res.status(404).json({ error: 'Property not found for this tenant' });
+    }
+
+    const isAdmin = ADMIN_EMAILS.includes((req.user.email || '').toLowerCase());
+    if (property.user_id !== req.user.id && !isAdmin) {
+      return res.status(403).json({ error: 'You do not manage this tenant' });
+    }
+
+    const { data, error } = await supabase
+      .from('tenants')
+      .update({ renewal_notice_sent_at: new Date() })
+      .eq('id', tenant_id)
+      .select();
+
+    if (error) {
+      return res.status(400).json({ error: error.message });
+    }
+
+    res.json({ success: true, tenant: data[0] });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Landlord: undo an accidental "notice sent" mark
+app.delete('/api/tenants/:tenant_id/renewal-notice-sent', requireAuth, async (req, res) => {
+  try {
+    const { tenant_id } = req.params;
+
+    const { data: tenant, error: tenantError } = await supabase
+      .from('tenants')
+      .select('property_id')
+      .eq('id', tenant_id)
+      .single();
+    if (tenantError || !tenant) {
+      return res.status(404).json({ error: 'Tenant not found' });
+    }
+
+    const { data: property, error: propertyError } = await supabase
+      .from('properties')
+      .select('user_id')
+      .eq('id', tenant.property_id)
+      .single();
+    if (propertyError || !property) {
+      return res.status(404).json({ error: 'Property not found for this tenant' });
+    }
+
+    const isAdmin = ADMIN_EMAILS.includes((req.user.email || '').toLowerCase());
+    if (property.user_id !== req.user.id && !isAdmin) {
+      return res.status(403).json({ error: 'You do not manage this tenant' });
+    }
+
+    const { data, error } = await supabase
+      .from('tenants')
+      .update({ renewal_notice_sent_at: null })
+      .eq('id', tenant_id)
+      .select();
+
+    if (error) {
+      return res.status(400).json({ error: error.message });
+    }
+
+    res.json({ success: true, tenant: data[0] });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ============================================
 // SMS MESSAGING ROUTES
 // ============================================
 
