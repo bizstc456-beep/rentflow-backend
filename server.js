@@ -1653,6 +1653,150 @@ app.put('/api/maintenance/:request_id', requireAuth, async (req, res) => {
 });
 
 // ============================================
+// VENDOR CONTACTS (electrician, plumber, cleaner, etc.)
+// ============================================
+// Vendors are landlord-level, not tied to a single property -- a quick
+// address book of go-to people for maintenance jobs. V1 is contact info
+// only; a later version may add referral tracking.
+
+const VENDOR_TRADES = ['general', 'plumbing', 'electrical', 'hvac', 'cleaning', 'landscaping', 'pest_control', 'locksmith', 'other'];
+
+// List a landlord's vendors
+app.get('/api/vendors/:user_id', requireAuth, async (req, res) => {
+  try {
+    const { user_id } = req.params;
+    const isAdmin = ADMIN_EMAILS.includes((req.user.email || '').toLowerCase());
+    if (req.user.id !== user_id && !isAdmin) {
+      return res.status(403).json({ error: "Cannot view another user's vendors" });
+    }
+
+    const { data, error } = await supabase
+      .from('vendors')
+      .select('*')
+      .eq('user_id', user_id)
+      .order('created_at', { ascending: true });
+
+    if (error) {
+      return res.status(400).json({ error: error.message });
+    }
+
+    res.json({ success: true, vendors: data || [] });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Add a vendor
+app.post('/api/vendors', requireAuth, async (req, res) => {
+  try {
+    const { trade, name, phone, email } = req.body;
+
+    if (!name || !phone) {
+      return res.status(400).json({ error: 'name and phone are required' });
+    }
+
+    const safeTrade = VENDOR_TRADES.includes(trade) ? trade : 'general';
+
+    const { data, error } = await supabase
+      .from('vendors')
+      .insert([{
+        user_id: req.user.id,
+        trade: safeTrade,
+        name,
+        phone,
+        email: email || null,
+        created_at: new Date(),
+      }])
+      .select();
+
+    if (error) {
+      return res.status(400).json({ error: error.message });
+    }
+
+    res.json({ success: true, vendor: data[0] });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Update a vendor you own
+app.put('/api/vendors/:vendor_id', requireAuth, async (req, res) => {
+  try {
+    const { vendor_id } = req.params;
+
+    const { data: existing, error: fetchError } = await supabase
+      .from('vendors')
+      .select('user_id')
+      .eq('id', vendor_id)
+      .single();
+    if (fetchError || !existing) {
+      return res.status(404).json({ error: 'Vendor not found' });
+    }
+
+    const isAdmin = ADMIN_EMAILS.includes((req.user.email || '').toLowerCase());
+    if (existing.user_id !== req.user.id && !isAdmin) {
+      return res.status(403).json({ error: 'You do not manage this vendor' });
+    }
+
+    const { trade, name, phone, email } = req.body;
+    if (!name || !phone) {
+      return res.status(400).json({ error: 'name and phone are required' });
+    }
+
+    const updates = {
+      trade: VENDOR_TRADES.includes(trade) ? trade : 'general',
+      name,
+      phone,
+      email: email || null,
+    };
+
+    const { data, error } = await supabase
+      .from('vendors')
+      .update(updates)
+      .eq('id', vendor_id)
+      .select();
+
+    if (error) {
+      return res.status(400).json({ error: error.message });
+    }
+
+    res.json({ success: true, vendor: data[0] });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Delete a vendor you own
+app.delete('/api/vendors/:vendor_id', requireAuth, async (req, res) => {
+  try {
+    const { vendor_id } = req.params;
+
+    const { data: existing, error: fetchError } = await supabase
+      .from('vendors')
+      .select('user_id')
+      .eq('id', vendor_id)
+      .single();
+    if (fetchError || !existing) {
+      return res.status(404).json({ error: 'Vendor not found' });
+    }
+
+    const isAdmin = ADMIN_EMAILS.includes((req.user.email || '').toLowerCase());
+    if (existing.user_id !== req.user.id && !isAdmin) {
+      return res.status(403).json({ error: 'You do not manage this vendor' });
+    }
+
+    const { error } = await supabase.from('vendors').delete().eq('id', vendor_id);
+    if (error) {
+      return res.status(400).json({ error: error.message });
+    }
+
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ============================================
 // LEASE RENEWAL ALERTS
 // ============================================
 // Quebec's Tribunal administratif du logement (TAL) requires landlords to
