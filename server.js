@@ -1027,6 +1027,180 @@ app.get('/api/reports/:user_id', requireAuth, async (req, res) => {
 });
 
 // ============================================
+// INSIGHTS ROUTES
+// ============================================
+// Portfolio-level cash flow and occupancy for landlords who think of
+// themselves as investors, not just rent collectors. Occupancy is inferred
+// from property_type -- there's no explicit unit-count field on properties,
+// so a duplex/triplex/fourplex is assumed to be exactly that many units and
+// everything else (single-family, condo, unset) is one.
+const UNITS_BY_PROPERTY_TYPE = { duplex: 2, triplex: 3, fourplex: 4 };
+function inferUnitCount(propertyType) {
+  return UNITS_BY_PROPERTY_TYPE[propertyType] || 1;
+}
+
+app.get('/api/insights/:user_id', requireAuth, async (req, res) => {
+  try {
+    const { user_id } = req.params;
+    const isAdmin = ADMIN_EMAILS.includes((req.user.email || '').toLowerCase());
+    if (req.user.id !== user_id && !isAdmin) {
+      return res.status(403).json({ error: "Cannot view another user's insights" });
+    }
+
+    const { data: properties, error: propsError } = await supabase
+      .from('properties')
+      .select('id, address, property_type')
+      .eq('user_id', user_id);
+    if (propsError) return res.status(400).json({ error: propsError.message });
+
+    const propertyIds = properties.map(p => p.id);
+
+    const { data: tenants } = await supabase
+      .from('tenants')
+      .select('id, property_id, rent_amount')
+      .in('property_id', propertyIds.length ? propertyIds : ['00000000-0000-0000-0000-000000000000']);
+    const tenantList = tenants || [];
+    const tenantIds = tenantList.map(t => t.id);
+
+    // Last 6 calendar months, oldest to newest, including the current
+    // (partial) month.
+    const now = new Date();
+    const months = [];
+    for (let i = 5; i >= 0; i--) {
+      const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
+      months.push({ year: d.getFullYear(), month: d.getMonth(), label: d.toLocaleString('en-US', { month: 'short' }) });
+    }
+    const windowStart = new Date(months[0].year, months[0].month, 1).toISOString().slice(0, 10);
+    const windowEnd = new Date(now.getFullYear(), now.getMonth() + 1, 0).toISOString().slice(0, 10);
+
+    let payments = [];
+    if (tenantIds.length) {
+      const { data } = await supabase
+        .from('payments')
+        .select('tenant_id, amount, payment_date')
+        .in('tenant_id', tenantIds)
+        .eq('status', 'paid')
+        .gte('payment_date', windowStart)
+        .lte('payment_date', windowEnd);
+      payments = data || [];
+    }
+
+    const { data: expensesData } = await supabase
+      .from('expenses')
+      .select('property_id, amount, category, expense_date')
+      .eq('user_id', user_id)
+      .gte('expense_date', windowStart)
+      .lte('expense_date', windowEnd);
+    const expenses = expensesData || [];
+
+    const monthKey = (year, month) => `${year}-${String(month + 1).padStart(2, '0')}`;
+    const incomeByMonth = {};
+    const expensesByMonth = {};
+    months.forEach(m => { incomeByMonth[monthKey(m.year, m.month)] = 0; expensesByMonth[monthKey(m.year, m.month)] = 0; });
+
+    payments.forEach(p => {
+      if (!p.payment_date) return;
+      const d = new Date(p.payment_date);
+      const key = monthKey(d.getFullYear(), d.getMonth());
+      if (key in incomeByMonth) incomeByMonth[key] += (p.amount || 0);
+    });
+    expenses.forEach(e => {
+      if (!e.expense_date) return;
+      const d = new Date(e.expense_date);
+      const key = monthKey(d.getFullYear(), d.getMonth());
+      if (key in expensesByMonth) expensesByMonth[key] += (e.amount || 0);
+    });
+
+    const cashFlow = months.map(m => {
+      const key = monthKey(m.year, m.month);
+      const income = incomeByMonth[key] || 0;
+      const expensesTotal = expensesByMonth[key] || 0;
+      return { month: key, label: m.label, income, expenses: expensesTotal, net: income - expensesTotal };
+    });
+
+    const expensesByCategoryMap = {};
+    expenses.forEach(e => {
+      expensesByCategoryMap[e.category] = (expensesByCategoryMap[e.category] || 0) + (e.amount || 0);
+    });
+
+    // Per-property occupancy + current rent roll (what's currently leased,
+    // not a particular month's collected payments).
+    const tenantsByProperty = {};
+    tenantList.forEach(t => {
+      if (!tenantsByProperty[t.property_id]) tenantsByProperty[t.property_id] = [];
+      tenantsByProperty[t.property_id].push(t);
+    });
+
+    let totalUnits = 0;
+    let totalOccupied = 0;
+    let totalRentRoll = 0;
+    let totalVacancyLoss = 0;
+
+    const propertyInsights = properties.map(p => {
+      const propTenants = tenantsByProperty[p.id] || [];
+      const units = inferUnitCount(p.property_type);
+      const occupied = Math.min(propTenants.length, units);
+      const vacant = Math.max(units - occupied, 0);
+      const income = propTenants.reduce((sum, t) => sum + (t.rent_amount || 0), 0);
+      const avgRent = occupied > 0 ? Math.round(income / occupied) : 0;
+      const vacancyLoss = vacant * avgRent;
+
+      totalUnits += units;
+      totalOccupied += occupied;
+      totalRentRoll += income;
+      totalVacancyLoss += vacancyLoss;
+
+      return {
+        id: p.id,
+        address: p.address,
+        property_type: p.property_type,
+        units,
+        occupied,
+        vacant,
+        income,
+        vacancy_loss: vacancyLoss,
+      };
+    });
+
+    // A wholly-vacant property has no in-property rent to average from --
+    // fall back to the portfolio's own average occupied rent so it still
+    // gets a loss estimate instead of $0.
+    const portfolioAvgRent = totalOccupied > 0 ? Math.round(totalRentRoll / totalOccupied) : 0;
+    propertyInsights.forEach(p => {
+      if (p.vacant > 0 && p.occupied === 0 && portfolioAvgRent > 0) {
+        const extra = p.vacant * portfolioAvgRent;
+        totalVacancyLoss += extra - p.vacancy_loss;
+        p.vacancy_loss = extra;
+      }
+    });
+
+    const currentMonth = cashFlow[cashFlow.length - 1] || { income: 0, expenses: 0, net: 0 };
+    const previousMonth = cashFlow.length > 1 ? cashFlow[cashFlow.length - 2] : null;
+    const netChangePct = previousMonth && previousMonth.net > 0
+      ? Math.round(((currentMonth.net - previousMonth.net) / previousMonth.net) * 100)
+      : null;
+
+    res.json({
+      success: true,
+      summary: {
+        net_cash_flow: currentMonth.net,
+        net_change_pct: netChangePct,
+        occupancy_units: totalUnits,
+        occupancy_occupied: totalOccupied,
+        occupancy_pct: totalUnits > 0 ? Math.round((totalOccupied / totalUnits) * 100) : 0,
+        vacancy_loss: totalVacancyLoss,
+        avg_rent_per_unit: totalOccupied > 0 ? Math.round(totalRentRoll / totalOccupied) : 0,
+      },
+      cash_flow: cashFlow,
+      expenses_by_category: Object.entries(expensesByCategoryMap).map(([category, amount]) => ({ category, amount })),
+      properties: propertyInsights,
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ============================================
 // DOCUMENT MANAGEMENT ROUTES
 // ============================================
 // Files live in the private "documents" Supabase Storage bucket, one row per
