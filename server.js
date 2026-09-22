@@ -2257,12 +2257,75 @@ app.get('/api/admin/stats', requireAdmin, async (req, res) => {
     const { data: payments, error: paymentsError } = await supabase.from('payments').select('*');
     if (paymentsError) throw paymentsError;
 
+    const { data: maintenanceRequests, error: maintenanceError } = await supabase
+      .from('maintenance_requests')
+      .select('status');
+    if (maintenanceError) throw maintenanceError;
+
+    const { data: customers, error: customersError } = await supabase
+      .from('customers')
+      .select('user_id, email, subscription_status, created_at');
+    if (customersError) throw customersError;
+
     const users = usersPage.users.map(u => ({
       id: u.id,
       email: u.email,
       created_at: u.created_at,
       confirmed_at: u.email_confirmed_at,
     }));
+
+    // ---- Signups, last 8 weeks (rolling 7-day buckets, oldest first) ----
+    const MS_PER_DAY = 24 * 60 * 60 * 1000;
+    const now = new Date();
+    const signupsByWeek = [];
+    for (let i = 7; i >= 0; i--) {
+      const bucketEnd = new Date(now.getTime() - i * 7 * MS_PER_DAY);
+      const bucketStart = new Date(bucketEnd.getTime() - 7 * MS_PER_DAY);
+      const count = users.filter(u => {
+        const created = new Date(u.created_at);
+        return created > bucketStart && created <= bucketEnd;
+      }).length;
+      signupsByWeek.push({ week_ending: bucketEnd.toISOString().slice(0, 10), count });
+    }
+
+    // ---- Needs attention: stalled onboarding + failed/past-due billing ----
+    const propertyCountByUser = {};
+    properties.forEach(p => {
+      propertyCountByUser[p.user_id] = (propertyCountByUser[p.user_id] || 0) + 1;
+    });
+
+    const threeDaysAgo = new Date(now.getTime() - 3 * MS_PER_DAY);
+    const stalledOnboarding = users
+      .filter(u => !propertyCountByUser[u.id] && new Date(u.created_at) < threeDaysAgo)
+      .map(u => ({
+        email: u.email,
+        reason: 'no_properties',
+        since: u.created_at,
+      }));
+
+    const billingIssues = (customers || [])
+      .filter(c => c.subscription_status && c.subscription_status !== 'active')
+      .map(c => ({
+        email: c.email,
+        reason: 'payment_failed',
+        since: c.created_at,
+      }));
+
+    const needsAttention = [...billingIssues, ...stalledOnboarding].slice(0, 8);
+
+    // ---- Platform activity ----
+    const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
+    const sevenDaysAgo = new Date(now.getTime() - 7 * MS_PER_DAY);
+
+    const paymentsThisMonth = payments.filter(
+      p => p.status === 'paid' && new Date(p.created_at) >= startOfMonth
+    ).length;
+    const maintenanceOpen = maintenanceRequests.filter(
+      m => m.status === 'open' || m.status === 'in_progress'
+    ).length;
+    const propertiesThisWeek = properties.filter(
+      p => new Date(p.created_at) >= sevenDaysAgo
+    ).length;
 
     res.json({
       success: true,
@@ -2271,7 +2334,12 @@ app.get('/api/admin/stats', requireAdmin, async (req, res) => {
         totalProperties: properties.length,
         totalTenants: tenants.length,
         totalRevenue: payments.reduce((sum, p) => sum + (p.amount || 0), 0),
+        paymentsThisMonth,
+        maintenanceOpen,
+        propertiesThisWeek,
       },
+      signupsByWeek,
+      needsAttention,
       users,
     });
   } catch (error) {
